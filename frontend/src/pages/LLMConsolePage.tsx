@@ -1,9 +1,9 @@
 import React, { useState, useEffect } from 'react';
 import {
-  Bot, Send, RefreshCw, CheckCircle2, AlertTriangle,
-  ThumbsUp, ThumbsDown, HelpCircle, ShieldAlert, Cpu, Sparkles, MessageSquare
+  Bot, Send, RefreshCw, CheckCircle2, AlertTriangle, XCircle,
+  ThumbsUp, ThumbsDown, HelpCircle, ShieldAlert, Cpu, Sparkles, MessageSquare, Wrench
 } from 'lucide-react';
-import { LLMProviderInfo, LLMResponseInfo } from '../types';
+import { LLMProviderInfo, LLMResponseInfo, LLMDiagnosticReport } from '../types';
 import { api } from '../services/api';
 
 interface LLMConsolePageProps {
@@ -21,6 +21,14 @@ export const LLMConsolePage: React.FC<LLMConsolePageProps> = ({
   const [providerMessage, setProviderMessage] = useState<string>('');
   const [models, setModels] = useState<string[]>([]);
   const [selectedModel, setSelectedModel] = useState<string>('');
+
+  // Diagnostic & Endpoint Configuration
+  const [hostInput, setHostInput] = useState<string>('127.0.0.1');
+  const [portInput, setPortInput] = useState<string>('11434');
+  const [allowRemote, setAllowRemote] = useState<boolean>(false);
+  const [diagnosticRunning, setDiagnosticRunning] = useState<boolean>(false);
+  const [diagnosticReport, setDiagnosticReport] = useState<LLMDiagnosticReport | null>(null);
+  const [showDiagnosticPanel, setShowDiagnosticPanel] = useState<boolean>(false);
 
   // Generation state
   const [prompt, setPrompt] = useState<string>('Analyze the reliability of the current visual component input.');
@@ -42,10 +50,18 @@ export const LLMConsolePage: React.FC<LLMConsolePageProps> = ({
       setProviders(res.providers || []);
       const active = res.active_provider || 'mock';
       setSelectedProvider(active);
+      updateDefaultPortForProvider(active);
       await checkHealthAndModels(active);
     } catch (err) {
       console.error(err);
     }
+  };
+
+  const updateDefaultPortForProvider = (provId: string) => {
+    if (provId === 'ollama') setPortInput('11434');
+    else if (provId === 'lm_studio') setPortInput('1234');
+    else if (provId === 'llama_cpp') setPortInput('8080');
+    else setPortInput('0');
   };
 
   const checkHealthAndModels = async (provId: string) => {
@@ -73,7 +89,44 @@ export const LLMConsolePage: React.FC<LLMConsolePageProps> = ({
 
   const handleProviderChange = async (newProv: string) => {
     setSelectedProvider(newProv);
+    updateDefaultPortForProvider(newProv);
+    setDiagnosticReport(null);
     await checkHealthAndModels(newProv);
+  };
+
+  const runDiagnosticTest = async (saveAsActive = false) => {
+    try {
+      setDiagnosticRunning(true);
+      setShowDiagnosticPanel(true);
+      const report = await api.testLLMConnection({
+        provider: selectedProvider,
+        host: hostInput,
+        port: parseInt(portInput, 10) || (selectedProvider === 'ollama' ? 11434 : 1234),
+        allow_remote: allowRemote,
+        save_if_successful: saveAsActive
+      });
+      setDiagnosticReport(report);
+
+      if (report.overall_status === 'connected' || report.overall_status === 'warning') {
+        setProviderConnected(true);
+        setProviderMessage(`Diagnostic passed. Discovered ${report.discovered_models.length} model(s).`);
+        setModels(report.discovered_models);
+        if (report.discovered_models.length > 0) {
+          setSelectedModel(report.discovered_models[0]);
+        }
+        if (saveAsActive) {
+          await loadProviders();
+        }
+      } else {
+        setProviderConnected(false);
+        setProviderMessage('Diagnostic test failed. Inspect step results below.');
+      }
+    } catch (err: any) {
+      setProviderConnected(false);
+      setProviderMessage(err.message || 'Diagnostic execution failed');
+    } finally {
+      setDiagnosticRunning(false);
+    }
   };
 
   const handleSendPrompt = async () => {
@@ -160,6 +213,110 @@ export const LLMConsolePage: React.FC<LLMConsolePageProps> = ({
                 ))}
               </select>
             </div>
+
+            {/* Custom Host & Port Configuration */}
+            {selectedProvider !== 'mock' && (
+              <div className="space-y-2 p-3 rounded-xl bg-slate-900/60 border border-slate-800">
+                <div className="grid grid-cols-3 gap-2">
+                  <div className="col-span-2">
+                    <label className="text-[10px] font-mono text-slate-400 block mb-1">Target Host:</label>
+                    <input
+                      type="text"
+                      value={hostInput}
+                      onChange={(e) => setHostInput(e.target.value)}
+                      placeholder="127.0.0.1"
+                      className="w-full bg-[#0d1322] border border-[#1f293d] rounded-lg px-2.5 py-1.5 text-xs text-white font-mono focus:outline-none focus:border-blue-500"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-[10px] font-mono text-slate-400 block mb-1">Port:</label>
+                    <input
+                      type="text"
+                      value={portInput}
+                      onChange={(e) => setPortInput(e.target.value)}
+                      placeholder="11434"
+                      className="w-full bg-[#0d1322] border border-[#1f293d] rounded-lg px-2.5 py-1.5 text-xs text-white font-mono focus:outline-none focus:border-blue-500"
+                    />
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-2 pt-1">
+                  <input
+                    type="checkbox"
+                    id="allowRemote"
+                    checked={allowRemote}
+                    onChange={(e) => setAllowRemote(e.target.checked)}
+                    className="rounded bg-slate-800 border-slate-700 text-blue-500 text-xs"
+                  />
+                  <label htmlFor="allowRemote" className="text-[10px] text-slate-400 cursor-pointer">
+                    Permit non-loopback IP (Overrides SSRF protection)
+                  </label>
+                </div>
+
+                <div className="flex items-center gap-2 pt-1.5">
+                  <button
+                    onClick={() => runDiagnosticTest(false)}
+                    disabled={diagnosticRunning}
+                    className="flex-1 py-1.5 rounded-lg bg-blue-600/30 hover:bg-blue-600/40 border border-blue-500/40 text-[11px] text-blue-200 font-medium flex items-center justify-center gap-1.5 transition"
+                  >
+                    <Wrench className={`w-3.5 h-3.5 ${diagnosticRunning ? 'animate-spin' : ''}`} />
+                    {diagnosticRunning ? 'Testing 5 Steps...' : '5-Step Diagnostic Probe'}
+                  </button>
+                  <button
+                    onClick={() => runDiagnosticTest(true)}
+                    disabled={diagnosticRunning}
+                    className="py-1.5 px-2.5 rounded-lg bg-emerald-600/30 hover:bg-emerald-600/40 border border-emerald-500/40 text-[11px] text-emerald-200 font-medium transition"
+                    title="Validate and save as active provider"
+                  >
+                    Save & Activate
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* 5-Step Diagnostic Results Panel */}
+            {diagnosticReport && (
+              <div className="p-3.5 rounded-xl bg-slate-900 border border-slate-800 space-y-2.5">
+                <div className="flex items-center justify-between">
+                  <span className="text-[11px] font-bold uppercase tracking-wider text-white">Diagnostic Results</span>
+                  <span className={`text-[10px] font-bold px-2 py-0.5 rounded uppercase ${
+                    diagnosticReport.overall_status === 'connected'
+                      ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
+                      : diagnosticReport.overall_status === 'warning'
+                      ? 'bg-amber-500/20 text-amber-400 border border-amber-500/30'
+                      : 'bg-rose-500/20 text-rose-400 border border-rose-500/30'
+                  }`}>
+                    {diagnosticReport.overall_status}
+                  </span>
+                </div>
+
+                <div className="space-y-2 font-mono text-[10px]">
+                  {diagnosticReport.steps.map((st) => (
+                    <div key={st.step_number} className="p-2 rounded-lg bg-[#0b0f19] border border-slate-800/80 space-y-1">
+                      <div className="flex items-center justify-between">
+                        <span className="flex items-center gap-1.5 font-bold text-slate-200">
+                          {st.status === 'pass' ? (
+                            <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                          ) : st.status === 'warn' ? (
+                            <AlertTriangle className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                          ) : (
+                            <XCircle className="w-3.5 h-3.5 text-rose-400 shrink-0" />
+                          )}
+                          Step {st.step_number}: {st.name}
+                        </span>
+                        <span className="text-slate-500 text-[9px]">{st.latency_ms}ms</span>
+                      </div>
+                      <p className="text-slate-400 pl-5 text-[10px] font-sans">{st.message}</p>
+                      {st.remedy && (
+                        <p className="text-amber-300/90 pl-5 text-[10px] font-sans bg-amber-950/20 p-1 rounded mt-1">
+                          Remedy: {st.remedy}
+                        </p>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
 
             {/* Connection Status Indicator */}
             <div className={`p-3 rounded-xl border text-xs flex items-start gap-2.5 ${

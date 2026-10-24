@@ -78,14 +78,32 @@ class UnifiedMonitoringEngine:
         self.image_state: str = "normal"
         self.audio_state: str = "normal"
         self.llm_state: str = "normal"
+        
+        # Subsystem-separated warning lists to avoid overwriting each other
+        self.active_image_warnings: List[MetricWarning] = []
+        self.active_audio_warnings: List[MetricWarning] = []
         self.active_warnings: List[MetricWarning] = []
+        
+        self.monitoring_active: bool = True
         self._last_event_time = 0.0
+        self._last_updated_time = time.time()
+
+    def set_monitoring_active(self, active: bool):
+        self.monitoring_active = active
+        self._last_updated_time = time.time()
 
     def process_image_frame(self,
                             raw_metrics: ImageQualityMetrics,
-                            predictions: ModelPredictions) -> Dict[str, Any]:
-        """Processes a live or uploaded image frame."""
+                            predictions: ModelPredictions,
+                            is_stream: bool = False) -> Dict[str, Any]:
+        """
+        Processes an image frame.
+        When is_stream is True (video feeds), applies moving average smoothing and hysteresis.
+        When is_stream is False (single uploaded image / lab test), immediately sets metrics,
+        state, and emits degradation event without waiting for hysteresis.
+        """
         self.latest_image_metrics = raw_metrics
+        self._last_updated_time = time.time()
         baseline = BaselineManager.get_or_create_default_image_baseline()
         baseline_stats = baseline.get("stats", {}) if baseline else {}
 
@@ -94,32 +112,52 @@ class UnifiedMonitoringEngine:
             raw_metrics, predictions, baseline_stats
         )
 
-        # 2. Smooth score and apply hysteresis for sustained deviations
-        smoothed_score = self.image_smoother.update("image_score", rel_score)
-        sustained_status = self.image_hysteresis.update(raw_status)
-
-        self.latest_image_score = round(smoothed_score, 1)
-        self.image_state = sustained_status
-
-        # 3. If sustained warning occurs, emit and record event to DB (rate-limited to 1 event per 3s)
         now = time.time()
-        if sustained_status in ["warning", "caution"] and (now - self._last_event_time > 3.0):
-            primary_warning = warnings[0] if warnings else None
-            if primary_warning:
-                add_event(
-                    subsystem="image",
-                    severity=sustained_status,
-                    title=f"Image {primary_warning.metric.capitalize()} Sustained Degradation",
-                    message=primary_warning.explanation,
-                    metric_name=primary_warning.metric,
-                    measured_value=primary_warning.measured_value,
-                    expected_range=primary_warning.expected_range,
-                    recommendation=primary_warning.recommendation,
-                    metadata={"reliability_score": self.latest_image_score, "raw_status": raw_status}
-                )
-                self._last_event_time = now
+        if is_stream:
+            # Smooth score and apply hysteresis for video stream to avoid flickering
+            smoothed_score = self.image_smoother.update("image_score", rel_score)
+            effective_status = self.image_hysteresis.update(raw_status)
+            self.latest_image_score = round(smoothed_score, 1)
+            self.image_state = effective_status
 
-        # Update active warnings list
+            if effective_status in ["warning", "caution"] and (now - self._last_event_time > 3.0):
+                primary_warning = warnings[0] if warnings else None
+                if primary_warning:
+                    add_event(
+                        subsystem="image",
+                        severity=effective_status,
+                        title=f"Image {primary_warning.metric.capitalize()} Sustained Degradation",
+                        message=primary_warning.explanation,
+                        metric_name=primary_warning.metric,
+                        measured_value=primary_warning.measured_value,
+                        expected_range=primary_warning.expected_range,
+                        recommendation=primary_warning.recommendation,
+                        metadata={"reliability_score": self.latest_image_score, "raw_status": raw_status}
+                    )
+                    self._last_event_time = now
+        else:
+            # Discrete / on-demand analysis: instantaneous evaluation
+            effective_status = raw_status
+            self.latest_image_score = round(rel_score, 1)
+            self.image_state = raw_status
+
+            if raw_status in ["warning", "caution"]:
+                primary_warning = warnings[0] if warnings else None
+                if primary_warning:
+                    add_event(
+                        subsystem="image",
+                        severity=raw_status,
+                        title=f"Image {primary_warning.metric.capitalize()} Degradation",
+                        message=primary_warning.explanation,
+                        metric_name=primary_warning.metric,
+                        measured_value=primary_warning.measured_value,
+                        expected_range=primary_warning.expected_range,
+                        recommendation=primary_warning.recommendation,
+                        metadata={"reliability_score": self.latest_image_score, "raw_status": raw_status}
+                    )
+                    self._last_event_time = now
+
+        # Update active warnings list specifically for image subsystem
         self._refresh_active_warnings(image_warnings=warnings)
 
         return {
@@ -127,7 +165,7 @@ class UnifiedMonitoringEngine:
             "predictions": predictions,
             "reliability_score": self.latest_image_score,
             "risk_score": round(100.0 - self.latest_image_score, 1),
-            "status": sustained_status,
+            "status": effective_status,
             "raw_status": raw_status,
             "warnings": warnings,
             "deviations": deviations
@@ -135,9 +173,16 @@ class UnifiedMonitoringEngine:
 
     def process_audio_chunk(self,
                             raw_metrics: AudioQualityMetrics,
-                            classification: Any) -> Dict[str, Any]:
-        """Processes a live or uploaded audio stream chunk."""
+                            classification: Any,
+                            is_stream: bool = False) -> Dict[str, Any]:
+        """
+        Processes an audio chunk.
+        When is_stream is True (mic streams), applies moving average smoothing and hysteresis.
+        When is_stream is False (single uploaded audio file), immediately sets metrics,
+        state, and emits degradation event.
+        """
         self.latest_audio_metrics = raw_metrics
+        self._last_updated_time = time.time()
         baseline = BaselineManager.get_or_create_default_audio_baseline()
         baseline_stats = baseline.get("stats", {}) if baseline else {}
 
@@ -146,30 +191,48 @@ class UnifiedMonitoringEngine:
             raw_metrics, classification, baseline_stats
         )
 
-        # 2. Smooth score and apply hysteresis
-        smoothed_score = self.audio_smoother.update("audio_score", rel_score)
-        sustained_status = self.audio_hysteresis.update(raw_status)
-
-        self.latest_audio_score = round(smoothed_score, 1)
-        self.audio_state = sustained_status
-
-        # 3. Record event if sustained
         now = time.time()
-        if sustained_status in ["warning", "caution"] and (now - self._last_event_time > 3.0):
-            primary_warning = warnings[0] if warnings else None
-            if primary_warning:
-                add_event(
-                    subsystem="audio",
-                    severity=sustained_status,
-                    title=f"Audio {primary_warning.metric.capitalize()} Degradation",
-                    message=primary_warning.explanation,
-                    metric_name=primary_warning.metric,
-                    measured_value=primary_warning.measured_value,
-                    expected_range=primary_warning.expected_range,
-                    recommendation=primary_warning.recommendation,
-                    metadata={"reliability_score": self.latest_audio_score}
-                )
-                self._last_event_time = now
+        if is_stream:
+            smoothed_score = self.audio_smoother.update("audio_score", rel_score)
+            effective_status = self.audio_hysteresis.update(raw_status)
+            self.latest_audio_score = round(smoothed_score, 1)
+            self.audio_state = effective_status
+
+            if effective_status in ["warning", "caution"] and (now - self._last_event_time > 3.0):
+                primary_warning = warnings[0] if warnings else None
+                if primary_warning:
+                    add_event(
+                        subsystem="audio",
+                        severity=effective_status,
+                        title=f"Audio {primary_warning.metric.capitalize()} Sustained Degradation",
+                        message=primary_warning.explanation,
+                        metric_name=primary_warning.metric,
+                        measured_value=primary_warning.measured_value,
+                        expected_range=primary_warning.expected_range,
+                        recommendation=primary_warning.recommendation,
+                        metadata={"reliability_score": self.latest_audio_score}
+                    )
+                    self._last_event_time = now
+        else:
+            effective_status = raw_status
+            self.latest_audio_score = round(rel_score, 1)
+            self.audio_state = raw_status
+
+            if raw_status in ["warning", "caution"]:
+                primary_warning = warnings[0] if warnings else None
+                if primary_warning:
+                    add_event(
+                        subsystem="audio",
+                        severity=raw_status,
+                        title=f"Audio {primary_warning.metric.capitalize()} Degradation",
+                        message=primary_warning.explanation,
+                        metric_name=primary_warning.metric,
+                        measured_value=primary_warning.measured_value,
+                        expected_range=primary_warning.expected_range,
+                        recommendation=primary_warning.recommendation,
+                        metadata={"reliability_score": self.latest_audio_score}
+                    )
+                    self._last_event_time = now
 
         self._refresh_active_warnings(audio_warnings=warnings)
 
@@ -178,7 +241,8 @@ class UnifiedMonitoringEngine:
             "classification": classification,
             "reliability_score": self.latest_audio_score,
             "risk_score": round(100.0 - self.latest_audio_score, 1),
-            "status": sustained_status,
+            "status": effective_status,
+            "raw_status": raw_status,
             "warnings": warnings,
             "deviations": deviations
         }
@@ -186,39 +250,81 @@ class UnifiedMonitoringEngine:
     def set_llm_status(self, state: str, score: float = 100.0):
         self.llm_state = state
         self.latest_llm_score = score
+        self._last_updated_time = time.time()
 
     def _refresh_active_warnings(self,
                                  image_warnings: Optional[List[MetricWarning]] = None,
                                  audio_warnings: Optional[List[MetricWarning]] = None):
-        combined = []
         if image_warnings is not None:
-            combined.extend(image_warnings)
+            self.active_image_warnings = image_warnings
         if audio_warnings is not None:
-            combined.extend(audio_warnings)
-        self.active_warnings = combined
+            self.active_audio_warnings = audio_warnings
+        self.active_warnings = self.active_image_warnings + self.active_audio_warnings
+
+    def notify_baseline_updated(self, baseline_type: str):
+        """Called when a baseline is created or activated."""
+        self._last_updated_time = time.time()
+        # Clear existing warnings for that subsystem so it can be cleanly re-evaluated
+        if baseline_type == "image":
+            self.active_image_warnings = []
+        elif baseline_type == "audio":
+            self.active_audio_warnings = []
+        self.active_warnings = self.active_image_warnings + self.active_audio_warnings
 
     def get_system_overall_status(self) -> SystemOverallStatus:
         """
         Determines overall system reliability state.
         Hierarchical rule:
+        - If monitoring is disabled -> 'unavailable'
         - If any subsystem has a severe WARNING, the overall state MUST be WARNING.
           (An acceptable audio score must not cancel a severe image warning).
         - If any subsystem has CAUTION and none WARNING -> CAUTION.
         - If all active subsystems are NORMAL -> NORMAL.
         """
-        subsystem_states = [self.image_state, self.audio_state, self.llm_state]
-
-        if "warning" in subsystem_states:
-            overall_state = "warning"
-        elif "caution" in subsystem_states:
-            overall_state = "caution"
-        elif "unavailable" in subsystem_states:
+        if not self.monitoring_active:
             overall_state = "unavailable"
         else:
-            overall_state = "normal"
+            subsystem_states = [self.image_state, self.audio_state, self.llm_state]
+            if "warning" in subsystem_states:
+                overall_state = "warning"
+            elif "caution" in subsystem_states:
+                overall_state = "caution"
+            elif "unavailable" in subsystem_states:
+                overall_state = "unavailable"
+            else:
+                overall_state = "normal"
 
         # Overall reliability score is dominated by the weakest subsystem (bottleneck principle)
         overall_reliability = min(self.latest_image_score, self.latest_audio_score, self.latest_llm_score)
+        
+        now = time.time()
+        time_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self._last_updated_time))
+
+        # Query active baseline metadata
+        try:
+            active_img = BaselineManager.get_or_create_default_image_baseline()
+            img_b_meta = {
+                "id": active_img.get("id"),
+                "name": active_img.get("name"),
+                "sample_count": active_img.get("sample_count", 0),
+                "is_active": active_img.get("is_active", True)
+            } if active_img else None
+        except Exception:
+            img_b_meta = None
+
+        try:
+            active_aud = BaselineManager.get_or_create_default_audio_baseline()
+            aud_b_meta = {
+                "id": active_aud.get("id"),
+                "name": active_aud.get("name"),
+                "sample_count": active_aud.get("sample_count", 0),
+                "is_active": active_aud.get("is_active", True)
+            } if active_aud else None
+        except Exception:
+            aud_b_meta = None
+
+        settings = get_all_settings()
+        active_provider = settings.get("llm_provider", "mock")
 
         return SystemOverallStatus(
             overall_state=overall_state,
@@ -230,7 +336,15 @@ class UnifiedMonitoringEngine:
             llm_state=self.llm_state,
             active_warnings=self.active_warnings,
             recent_events_count=len(self.active_warnings),
-            timestamp=time.time()
+            timestamp=now,
+            last_updated_formatted=time_str,
+            monitoring_active=self.monitoring_active,
+            active_image_baseline=img_b_meta,
+            active_audio_baseline=aud_b_meta,
+            active_model="mobilenetv3_small_v1",
+            active_provider=active_provider,
+            last_image_metrics=self.latest_image_metrics,
+            last_audio_metrics=self.latest_audio_metrics
         )
 
 # Global engine singleton

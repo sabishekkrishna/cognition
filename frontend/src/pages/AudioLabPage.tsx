@@ -9,10 +9,80 @@ import { ReliabilityGauge } from '../components/ReliabilityGauge';
 import { WarningCard } from '../components/WarningCard';
 import { WaveformVisualizer } from '../components/WaveformVisualizer';
 
+// Converts any browser-recorded audio (WebM/Opus/etc.) to standard 16-bit PCM WAV
+async function convertBlobToPcmWav(blob: Blob): Promise<Blob> {
+  const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+  if (!AudioCtx) return blob;
+  const audioContext = new AudioCtx();
+  try {
+    const arrayBuffer = await blob.arrayBuffer();
+    const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+
+    const numChannels = audioBuffer.numberOfChannels;
+    const sampleRate = audioBuffer.sampleRate;
+    const numSamples = audioBuffer.length;
+
+    // Downmix to mono float32
+    const monoData = new Float32Array(numSamples);
+    if (numChannels === 1) {
+      monoData.set(audioBuffer.getChannelData(0));
+    } else {
+      const ch0 = audioBuffer.getChannelData(0);
+      const ch1 = audioBuffer.getChannelData(1);
+      for (let i = 0; i < numSamples; i++) {
+        monoData[i] = (ch0[i] + ch1[i]) / 2.0;
+      }
+    }
+
+    // Build 16-bit PCM RIFF WAV
+    const wavBuffer = new ArrayBuffer(44 + numSamples * 2);
+    const view = new DataView(wavBuffer);
+
+    const writeString = (offset: number, str: string) => {
+      for (let i = 0; i < str.length; i++) {
+        view.setUint8(offset + i, str.charCodeAt(i));
+      }
+    };
+
+    writeString(0, 'RIFF');
+    view.setUint32(4, 36 + numSamples * 2, true);
+    writeString(8, 'WAVE');
+    writeString(12, 'fmt ');
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true); // PCM
+    view.setUint16(22, 1, true); // 1 channel
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * 2, true);
+    view.setUint16(32, 2, true);
+    view.setUint16(34, 16, true); // 16-bit
+    writeString(36, 'data');
+    view.setUint32(40, numSamples * 2, true);
+
+    let offset = 44;
+    for (let i = 0; i < numSamples; i++) {
+      const s = Math.max(-1, Math.min(1, monoData[i]));
+      const val = s < 0 ? s * 0x8000 : s * 0x7FFF;
+      view.setInt16(offset, val, true);
+      offset += 2;
+    }
+
+    return new Blob([view], { type: 'audio/wav' });
+  } catch (e) {
+    console.warn('Fallback to original recording blob:', e);
+    return blob;
+  } finally {
+    try {
+      await audioContext.close();
+    } catch (_) {}
+  }
+}
+
 export const AudioLabPage: React.FC = () => {
   const [audioBlob, setAudioBlob] = useState<Blob | null>(null);
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
+  const [audioFileName, setAudioFileName] = useState<string>('sample.wav');
   const [loading, setLoading] = useState(false);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [analysis, setAnalysis] = useState<AudioAnalysisResponse | null>(null);
 
   // Recording state
@@ -36,7 +106,22 @@ export const AudioLabPage: React.FC = () => {
   } | null>(null);
 
   const handleAudioUpload = async (file: Blob | File) => {
+    setErrorMessage(null);
+
+    // Validation checks
+    if (file.size === 0) {
+      setErrorMessage('The selected file is empty (0 bytes). Please upload a valid recording.');
+      return;
+    }
+    if (file.size > 50 * 1024 * 1024) {
+      setErrorMessage('Audio file exceeds maximum allowed size of 50 MB.');
+      return;
+    }
+
     setAudioBlob(file);
+    const fileName = file instanceof File ? file.name : 'mic_recording.wav';
+    setAudioFileName(fileName);
+
     const url = URL.createObjectURL(file);
     setAudioUrl(url);
     setDegradeComparison(null);
@@ -47,7 +132,7 @@ export const AudioLabPage: React.FC = () => {
       const res = await api.analyzeAudio(file);
       setAnalysis(res);
     } catch (err: any) {
-      alert(err.message || 'Error analyzing audio');
+      setErrorMessage(err.message || 'Error analyzing audio recording');
     } finally {
       setLoading(false);
     }
@@ -56,15 +141,17 @@ export const AudioLabPage: React.FC = () => {
   const loadSampleAudio = async () => {
     try {
       setLoading(true);
+      setErrorMessage(null);
       const blob = await api.getSampleAudioBlob();
       await handleAudioUpload(blob);
     } catch (err: any) {
-      alert('Error loading sample audio: ' + err.message);
+      setErrorMessage('Error loading sample audio: ' + err.message);
       setLoading(false);
     }
   };
 
   const startRecording = async () => {
+    setErrorMessage(null);
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       audioChunksRef.current = [];
@@ -77,16 +164,18 @@ export const AudioLabPage: React.FC = () => {
         }
       };
 
-      mediaRecorder.onstop = () => {
-        const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/wav' });
-        handleAudioUpload(audioBlob);
+      mediaRecorder.onstop = async () => {
+        const rawBlob = new Blob(audioChunksRef.current, { type: mediaRecorder.mimeType || 'audio/webm' });
+        // Convert webm/opus to true 16-bit PCM WAV
+        const wavBlob = await convertBlobToPcmWav(rawBlob);
+        await handleAudioUpload(wavBlob);
         stream.getTracks().forEach((track) => track.stop());
       };
 
       mediaRecorder.start();
       setIsRecording(true);
     } catch (err) {
-      alert('Microphone access denied or unavailable: ' + err);
+      setErrorMessage('Microphone access denied or unavailable: ' + err);
     }
   };
 
@@ -135,6 +224,20 @@ export const AudioLabPage: React.FC = () => {
 
   return (
     <div className="space-y-6">
+      {/* Error Banner */}
+      {errorMessage && (
+        <div className="p-3.5 rounded-xl bg-rose-950/50 border border-rose-700/60 flex items-center gap-2.5 text-xs text-rose-200 shadow-sm animate-pulse">
+          <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" />
+          <span className="flex-1 font-mono">{errorMessage}</span>
+          <button
+            onClick={() => setErrorMessage(null)}
+            className="text-rose-400 hover:text-white font-bold px-2 py-0.5 rounded bg-rose-900/40 transition"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
+
       {/* Title & Actions */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-2 border-b border-[#1f293d]">
         <div>
@@ -186,16 +289,17 @@ export const AudioLabPage: React.FC = () => {
                   Start Microphone Recording
                 </button>
               )}
-              <p className="text-[10px] text-slate-500 mt-2 font-mono">Explicit user trigger required. Zero background recording.</p>
+              <p className="text-[10px] text-slate-500 mt-2 font-mono">PCM WAV in-browser encoding. Zero background recording.</p>
             </div>
 
             {/* Or File Upload */}
             <label className="border-2 border-dashed border-slate-700 hover:border-violet-500/60 rounded-xl p-4 flex flex-col items-center justify-center cursor-pointer transition bg-slate-900/30 group">
               <Upload className="w-5 h-5 text-slate-400 group-hover:text-violet-400 mb-1.5 transition" />
-              <span className="text-xs font-medium text-slate-200">Or Upload Audio File (WAV, MP3)</span>
+              <span className="text-xs font-medium text-slate-200">Upload Audio File (WAV, MP3, FLAC, OGG)</span>
+              <span className="text-[10px] text-slate-400 mt-0.5">Loaded: {audioFileName}</span>
               <input
                 type="file"
-                accept="audio/*"
+                accept="audio/*,.wav,.mp3,.flac,.ogg,.m4a"
                 className="hidden"
                 onChange={(e) => {
                   if (e.target.files && e.target.files[0]) {

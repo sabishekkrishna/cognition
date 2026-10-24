@@ -5,13 +5,22 @@ import { SystemOverallStatus } from '../types';
 interface HeaderProps {
   status: SystemOverallStatus | null;
   activeProviderName: string;
+  isOnline?: boolean;
 }
 
-export const Header: React.FC<HeaderProps> = ({ status, activeProviderName }) => {
-  const overallState = status?.overall_state || 'normal';
-  const score = status?.overall_reliability_score ?? 100;
+export const Header: React.FC<HeaderProps> = ({ status, activeProviderName, isOnline = true }) => {
+  const overallState = (!isOnline || status?.overall_state === 'unavailable') ? 'unavailable' : (status?.overall_state || 'normal');
+  const score = isOnline ? (status?.overall_reliability_score ?? 100) : 0;
 
   const getStatusBadge = () => {
+    if (!isOnline) {
+      return {
+        bg: 'bg-rose-950/40 border-rose-700/60 text-rose-300',
+        dot: 'bg-rose-500',
+        icon: AlertTriangle,
+        label: 'BACKEND DISCONNECTED'
+      };
+    }
     switch (overallState) {
       case 'warning':
         return {
@@ -29,7 +38,7 @@ export const Header: React.FC<HeaderProps> = ({ status, activeProviderName }) =>
         };
       case 'unavailable':
         return {
-          bg: 'bg-slate-700/50 border-slate-600 text-slate-300',
+          bg: 'bg-slate-800/80 border-slate-700 text-slate-300',
           dot: 'bg-slate-400',
           icon: Activity,
           label: 'MONITORING DISCONNECTED'

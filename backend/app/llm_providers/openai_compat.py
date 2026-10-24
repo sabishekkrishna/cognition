@@ -19,6 +19,9 @@ class OpenAICompatProvider(BaseLLMProvider):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout_sec
 
+    def set_base_url(self, base_url: str):
+        self.base_url = base_url.rstrip("/")
+
     def get_provider_name(self) -> str:
         return self.provider_id
 

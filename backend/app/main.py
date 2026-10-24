@@ -46,23 +46,40 @@ async def websocket_monitor_endpoint(websocket: WebSocket):
     classifier = get_classifier()
     audio_classifier = get_audio_classifier()
 
+    # Send current overall status immediately upon connecting
+    try:
+        init_overall = engine.get_system_overall_status()
+        await websocket.send_json({
+            "type": "status_update",
+            "overall": init_overall.dict()
+        })
+    except Exception:
+        pass
+
     try:
         while True:
             data_text = await websocket.receive_text()
             message = json.loads(data_text)
             msg_type = message.get("type")
 
-            if msg_type == "video_frame":
+            if msg_type == "get_status":
+                overall = engine.get_system_overall_status()
+                await websocket.send_json({
+                    "type": "status_update",
+                    "overall": overall.dict()
+                })
+
+            elif msg_type == "video_frame":
                 frame_b64 = message.get("frame_base64", "")
                 if "," in frame_b64:
                     frame_b64 = frame_b64.split(",")[1]
                 frame_bytes = base64.b64decode(frame_b64)
                 img = decode_image_bytes(frame_bytes)
 
-                # Process image
+                # Process image in streaming mode (smoothing + hysteresis)
                 metrics = analyze_image_quality(img)
                 preds = classifier.predict(img, top_k=3)
-                res = engine.process_image_frame(metrics, preds)
+                res = engine.process_image_frame(metrics, preds, is_stream=True)
 
                 overall = engine.get_system_overall_status()
 
@@ -95,7 +112,7 @@ async def websocket_monitor_endpoint(websocket: WebSocket):
                     snr_db=metrics.snr_db,
                     spectral_centroid=metrics.spectral_centroid_hz
                 )
-                res = engine.process_audio_chunk(metrics, cond)
+                res = engine.process_audio_chunk(metrics, cond, is_stream=True)
                 overall = engine.get_system_overall_status()
 
                 await websocket.send_json({

@@ -98,6 +98,45 @@ export interface SystemOverallStatus {
   active_warnings: MetricWarning[];
   recent_events_count: number;
   timestamp: number;
+  last_updated_formatted?: string;
+  monitoring_active?: boolean;
+  active_image_baseline?: {
+    id: string;
+    name: string;
+    sample_count: number;
+    is_active: boolean;
+  } | null;
+  active_audio_baseline?: {
+    id: string;
+    name: string;
+    sample_count: number;
+    is_active: boolean;
+  } | null;
+  active_model?: string;
+  active_provider?: string;
+  last_image_metrics?: ImageQualityMetrics;
+  last_audio_metrics?: AudioQualityMetrics;
+}
+
+export interface DiagnosticStepResult {
+  step_number: number;
+  name: string;
+  status: 'pass' | 'fail' | 'warn';
+  latency_ms: number;
+  message: string;
+  remedy?: string;
+}
+
+export interface LLMDiagnosticReport {
+  provider: string;
+  target_url: string;
+  host: string;
+  port: number;
+  overall_status: 'connected' | 'warning' | 'failed';
+  steps: DiagnosticStepResult[];
+  discovered_models: string[];
+  sample_response?: string;
+  saved_as_active: boolean;
 }
 
 export interface LLMProviderInfo {

@@ -8,30 +8,70 @@ from ..storage.database import (
 )
 from ..schemas.schemas import ImageQualityMetrics, AudioQualityMetrics, ModelPredictions, BaselineInfo
 
-def compute_robust_distribution(values: List[float]) -> Dict[str, float]:
+# Domain-specific minimum variability thresholds to prevent division by zero or distortion on identical inputs
+DOMAIN_MIN_MAD: Dict[str, float] = {
+    # Audio metrics
+    "spectral_centroid_hz": 100.0,
+    "spectral_rolloff_hz": 150.0,
+    "rms_dbfs": 2.0,
+    "background_noise_db": 3.0,
+    "snr_db": 2.5,
+    "speech_ratio": 0.05,
+    "silence_ratio": 0.05,
+    "clipping_pct": 0.5,
+    "peak_amplitude": 0.05,
+    "duration_sec": 0.5,
+    # Image metrics
+    "brightness": 5.0,
+    "sharpness": 10.0,
+    "contrast": 4.0,
+    "color_mean_r": 5.0,
+    "color_mean_g": 5.0,
+    "color_mean_b": 5.0,
+    "color_cast_delta": 3.0,
+    "noise_estimate": 1.0,
+    "underexposure_pct": 1.0,
+    "overexposure_pct": 1.0,
+    "model_confidence": 0.05,
+    "model_entropy": 0.2,
+    "model_margin": 0.05
+}
+
+def compute_robust_distribution(values: List[float], metric_name: Optional[str] = None) -> Dict[str, float]:
     """
     Computes robust descriptive statistics for a distribution:
-    mean, std, median, MAD (Median Absolute Deviation), 5th and 95th percentiles, min, max.
+    mean, std, median, MAD (Median Absolute Deviation scaled by 1.4826),
+    10th and 90th percentiles, 5th and 95th percentiles, min, max.
+    Guarantees non-zero MAD using domain-specific fallback thresholds.
     """
+    min_threshold = DOMAIN_MIN_MAD.get(metric_name, 1.0) if metric_name else 1.0
+
     if not values:
         return {
-            "mean": 0.0, "std": 0.0, "median": 0.0, "mad": 0.0,
-            "p5": 0.0, "p95": 0.0, "min": 0.0, "max": 0.0
+            "mean": 0.0, "std": 0.0, "median": 0.0, "mad": min_threshold,
+            "p10": 0.0, "p90": 0.0, "p5": 0.0, "p95": 0.0, "min": 0.0, "max": 0.0
         }
 
     arr = np.array(values, dtype=np.float64)
     med = float(np.median(arr))
     # Median Absolute Deviation (MAD), scaled by 1.4826 for normal consistency
     abs_deviations = np.abs(arr - med)
-    mad = float(np.median(abs_deviations) * 1.4826)
-    if mad < 1e-4:
-        mad = float(np.std(arr)) if np.std(arr) > 1e-4 else 1.0
+    raw_mad = float(np.median(abs_deviations) * 1.4826)
+    
+    # If MAD is near zero (e.g. identical samples), use std or domain-specific floor
+    if raw_mad < 1e-4:
+        sample_std = float(np.std(arr))
+        mad = sample_std if sample_std > 1e-4 else min_threshold
+    else:
+        mad = max(raw_mad, min_threshold * 0.2) # Avoid unrealistically hyper-sensitive MAD
 
     return {
         "mean": float(round(np.mean(arr), 2)),
         "std": float(round(np.std(arr), 2)),
         "median": float(round(med, 2)),
         "mad": float(round(mad, 2)),
+        "p10": float(round(np.percentile(arr, 10), 2)),
+        "p90": float(round(np.percentile(arr, 90), 2)),
         "p5": float(round(np.percentile(arr, 5), 2)),
         "p95": float(round(np.percentile(arr, 95), 2)),
         "min": float(round(np.min(arr), 2)),
@@ -65,7 +105,7 @@ class BaselineManager:
 
         for k in metric_keys:
             vals = [getattr(m, k) for m in metrics_list]
-            stats[k] = compute_robust_distribution(vals)
+            stats[k] = compute_robust_distribution(vals, metric_name=k)
 
         # Model confidence statistics & reference embedding
         if predictions_list:
@@ -73,12 +113,20 @@ class BaselineManager:
             entropies = [p.entropy for p in predictions_list]
             margins = [p.margin for p in predictions_list]
 
-            stats["model_confidence"] = compute_robust_distribution(top_probs)
-            stats["model_entropy"] = compute_robust_distribution(entropies)
-            stats["model_margin"] = compute_robust_distribution(margins)
+            stats["model_confidence"] = compute_robust_distribution(top_probs, metric_name="model_confidence")
+            stats["model_entropy"] = compute_robust_distribution(entropies, metric_name="model_entropy")
+            stats["model_margin"] = compute_robust_distribution(margins, metric_name="model_margin")
 
+        stats["_schema_version"] = "v1.0"
         baseline_id = f"img_base_{int(time.time())}_{uuid.uuid4().hex[:6]}"
         save_baseline(baseline_id, name, "image", description, sample_count, stats, set_active=set_active)
+
+        if set_active:
+            try:
+                from ..monitoring.engine import get_monitoring_engine
+                get_monitoring_engine().notify_baseline_updated("image")
+            except Exception:
+                pass
 
         return BaselineInfo(
             id=baseline_id,
@@ -111,10 +159,18 @@ class BaselineManager:
 
         for k in audio_keys:
             vals = [getattr(m, k) for m in metrics_list]
-            stats[k] = compute_robust_distribution(vals)
+            stats[k] = compute_robust_distribution(vals, metric_name=k)
 
+        stats["_schema_version"] = "v1.0"
         baseline_id = f"aud_base_{int(time.time())}_{uuid.uuid4().hex[:6]}"
         save_baseline(baseline_id, name, "audio", description, sample_count, stats, set_active=set_active)
+
+        if set_active:
+            try:
+                from ..monitoring.engine import get_monitoring_engine
+                get_monitoring_engine().notify_baseline_updated("audio")
+            except Exception:
+                pass
 
         return BaselineInfo(
             id=baseline_id,
@@ -140,9 +196,10 @@ class BaselineManager:
             if key in baseline_stats:
                 b = baseline_stats[key]
                 median = b.get("median", 0.0)
-                mad = b.get("mad", 1.0)
-                if mad <= 0:
-                    mad = 1.0
+                min_mad = DOMAIN_MIN_MAD.get(key, 1.0)
+                mad = b.get("mad", min_mad)
+                if mad < min_mad * 0.2:
+                    mad = min_mad
                 val = getattr(metrics, key, 0.0)
                 dev = (val - median) / mad
                 deviations[key] = float(round(dev, 2))
@@ -156,9 +213,10 @@ class BaselineManager:
             if key in baseline_stats:
                 b = baseline_stats[key]
                 median = b.get("median", 0.0)
-                mad = b.get("mad", 1.0)
-                if mad <= 0:
-                    mad = 1.0
+                min_mad = DOMAIN_MIN_MAD.get(key, 1.0)
+                mad = b.get("mad", min_mad)
+                if mad < min_mad * 0.2:
+                    mad = min_mad
                 val = getattr(metrics, key, 0.0)
                 dev = (val - median) / mad
                 deviations[key] = float(round(dev, 2))

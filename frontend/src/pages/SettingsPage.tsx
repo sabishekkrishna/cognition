@@ -5,10 +5,15 @@ import {
 } from 'lucide-react';
 import { api } from '../services/api';
 
-export const SettingsPage: React.FC = () => {
+interface SettingsPageProps {
+  onSettingsSaved?: () => void;
+}
+
+export const SettingsPage: React.FC<SettingsPageProps> = ({ onSettingsSaved }) => {
   const [settings, setSettings] = useState<Record<string, string>>({});
   const [loading, setLoading] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [testStatus, setTestStatus] = useState<string | null>(null);
 
   useEffect(() => {
     loadSettings();
@@ -37,11 +42,31 @@ export const SettingsPage: React.FC = () => {
       setLoading(true);
       await api.updateSettings(settings);
       setSaved(true);
+      onSettingsSaved?.();
       setTimeout(() => setSaved(false), 3000);
     } catch (err: any) {
       alert('Save error: ' + err.message);
     } finally {
       setLoading(false);
+    }
+  };
+
+  const testEndpoint = async (provider: string, url: string) => {
+    try {
+      setTestStatus(`Testing ${provider}...`);
+      const res = await api.testLLMConnection({
+        provider,
+        base_url: url,
+        allow_remote: settings.allow_remote_llm === 'true'
+      });
+      if (res.overall_status === 'connected') {
+        setTestStatus(`✓ ${provider} connected! (${res.discovered_models.length} models)`);
+      } else {
+        const firstFail = res.steps.find((s) => s.status === 'fail');
+        setTestStatus(`✕ ${provider} failed: ${firstFail?.message || 'Connection refused'}`);
+      }
+    } catch (err: any) {
+      setTestStatus(`✕ ${provider} error: ${err.message}`);
     }
   };
 
@@ -81,7 +106,16 @@ export const SettingsPage: React.FC = () => {
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <div>
-              <label className="text-[11px] font-mono text-slate-400 block mb-1">Ollama Local Daemon URL:</label>
+              <div className="flex justify-between items-center mb-1">
+                <label className="text-[11px] font-mono text-slate-400">Ollama Local Daemon URL:</label>
+                <button
+                  type="button"
+                  onClick={() => testEndpoint('ollama', settings.ollama_url || 'http://127.0.0.1:11434')}
+                  className="text-[10px] text-blue-400 hover:text-blue-300 font-mono"
+                >
+                  Test Reachability
+                </button>
+              </div>
               <input
                 type="text"
                 value={settings.ollama_url || 'http://127.0.0.1:11434'}
@@ -91,7 +125,16 @@ export const SettingsPage: React.FC = () => {
             </div>
 
             <div>
-              <label className="text-[11px] font-mono text-slate-400 block mb-1">OpenAI-Compat / LM Studio URL:</label>
+              <div className="flex justify-between items-center mb-1">
+                <label className="text-[11px] font-mono text-slate-400">OpenAI-Compat / LM Studio URL:</label>
+                <button
+                  type="button"
+                  onClick={() => testEndpoint('lm_studio', settings.openai_compat_url || 'http://127.0.0.1:1234/v1')}
+                  className="text-[10px] text-blue-400 hover:text-blue-300 font-mono"
+                >
+                  Test Reachability
+                </button>
+              </div>
               <input
                 type="text"
                 value={settings.openai_compat_url || 'http://127.0.0.1:1234/v1'}
@@ -100,6 +143,31 @@ export const SettingsPage: React.FC = () => {
               />
             </div>
           </div>
+
+          {/* SSRF Protection Policy */}
+          <div className="p-3 rounded-xl bg-slate-900/60 border border-slate-800 space-y-1.5">
+            <div className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                id="allow_remote_llm"
+                checked={settings.allow_remote_llm === 'true'}
+                onChange={(e) => handleChange('allow_remote_llm', e.target.checked ? 'true' : 'false')}
+                className="rounded bg-slate-800 border-slate-700 text-blue-500"
+              />
+              <label htmlFor="allow_remote_llm" className="text-xs font-semibold text-slate-200 cursor-pointer">
+                Permit Remote / Non-Loopback LLM IP Addresses (Overrides SSRF Safeguard)
+              </label>
+            </div>
+            <p className="text-[10px] text-slate-500 pl-5">
+              By default, connections to non-loopback addresses (outside 127.0.0.1 and localhost) are rejected to prevent internal network scanning and SSRF.
+            </p>
+          </div>
+
+          {testStatus && (
+            <p className="text-xs font-mono p-2 rounded bg-slate-900 border border-slate-800 text-slate-300">
+              {testStatus}
+            </p>
+          )}
         </div>
 
         {/* Sensitivity & Hysteresis Thresholds */}

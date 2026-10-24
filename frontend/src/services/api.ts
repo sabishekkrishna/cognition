@@ -1,7 +1,7 @@
 import {
   ImageAnalysisResponse, AudioAnalysisResponse,
   SystemOverallStatus, LLMResponseInfo, BaselineInfo,
-  DatasetInfo, ModelVersionInfo, EventItem
+  DatasetInfo, ModelVersionInfo, EventItem, LLMDiagnosticReport
 } from '../types';
 
 const API_BASE = 'http://127.0.0.1:8000/api';
@@ -71,7 +71,8 @@ export const api = {
   // Audio Lab
   async analyzeAudio(file: Blob | File): Promise<AudioAnalysisResponse> {
     const form = new FormData();
-    form.append('file', file, 'audio.wav');
+    const filename = file instanceof File ? file.name : 'recording.wav';
+    form.append('file', file, filename);
     const res = await fetch(`${API_BASE}/audio/analyze`, {
       method: 'POST',
       body: form
@@ -90,7 +91,8 @@ export const api = {
     clipping_gain: number;
   }) {
     const form = new FormData();
-    form.append('file', file, 'audio.wav');
+    const filename = file instanceof File ? file.name : 'recording.wav';
+    form.append('file', file, filename);
     form.append('volume_factor', params.volume_factor.toString());
     if (params.noise_type) {
       form.append('noise_type', params.noise_type);
@@ -102,7 +104,10 @@ export const api = {
       method: 'POST',
       body: form
     });
-    if (!res.ok) throw new Error('Failed to apply audio degradation');
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || 'Failed to apply audio degradation');
+    }
     return res.json();
   },
 
@@ -165,6 +170,36 @@ export const api = {
     return res.json();
   },
 
+  async testLLMConnection(payload: {
+    provider: string;
+    host?: string;
+    port?: number;
+    base_url?: string;
+    model?: string;
+    allow_remote?: boolean;
+    save_if_successful?: boolean;
+  }): Promise<LLMDiagnosticReport> {
+    const res = await fetch(`${API_BASE}/llm/test-connection`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || 'Failed to test LLM connection');
+    }
+    return res.json();
+  },
+
+  async setMonitoringActive(active: boolean) {
+    const res = await fetch(`${API_BASE}/monitor/state`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ active })
+    });
+    return res.json();
+  },
+
   // Baselines
   async listBaselines(type?: string): Promise<BaselineInfo[]> {
     const url = type ? `${API_BASE}/baselines?type=${type}` : `${API_BASE}/baselines`;
@@ -196,7 +231,10 @@ export const api = {
     }
     const endpoint = type === 'image' ? `${API_BASE}/baselines/create/image` : `${API_BASE}/baselines/create/audio`;
     const res = await fetch(endpoint, { method: 'POST', body: form });
-    if (!res.ok) throw new Error('Failed to create baseline profile');
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || 'Failed to create baseline profile');
+    }
     return res.json();
   },
 

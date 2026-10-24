@@ -6,10 +6,15 @@ import {
 import { BaselineInfo } from '../types';
 import { api } from '../services/api';
 
-export const BaselineManagerPage: React.FC = () => {
+interface BaselineManagerPageProps {
+  onBaselineChanged?: () => void;
+}
+
+export const BaselineManagerPage: React.FC<BaselineManagerPageProps> = ({ onBaselineChanged }) => {
   const [activeTab, setActiveTab] = useState<'image' | 'audio'>('image');
   const [baselines, setBaselines] = useState<BaselineInfo[]>([]);
   const [loading, setLoading] = useState(false);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [selectedBaseline, setSelectedBaseline] = useState<BaselineInfo | null>(null);
 
   // New Baseline Modal
@@ -25,6 +30,7 @@ export const BaselineManagerPage: React.FC = () => {
   const loadBaselines = async () => {
     try {
       setLoading(true);
+      setErrorMessage(null);
       const data = await api.listBaselines(activeTab);
       setBaselines(data);
       if (data.length > 0) {
@@ -33,8 +39,8 @@ export const BaselineManagerPage: React.FC = () => {
       } else {
         setSelectedBaseline(null);
       }
-    } catch (err) {
-      console.error(err);
+    } catch (err: any) {
+      setErrorMessage(err.message || 'Failed to load baseline profiles');
     } finally {
       setLoading(false);
     }
@@ -44,8 +50,9 @@ export const BaselineManagerPage: React.FC = () => {
     try {
       await api.activateBaseline(id);
       await loadBaselines();
+      onBaselineChanged?.();
     } catch (err: any) {
-      alert('Activation error: ' + err.message);
+      setErrorMessage('Activation error: ' + err.message);
     }
   };
 
@@ -54,8 +61,9 @@ export const BaselineManagerPage: React.FC = () => {
       try {
         await api.deleteBaseline(id);
         await loadBaselines();
+        onBaselineChanged?.();
       } catch (err: any) {
-        alert('Delete error: ' + err.message);
+        setErrorMessage('Delete error: ' + err.message);
       }
     }
   };
@@ -69,14 +77,16 @@ export const BaselineManagerPage: React.FC = () => {
 
     try {
       setLoading(true);
+      setErrorMessage(null);
       await api.createBaseline(name, activeTab, description, files);
       setIsCreating(false);
       setName('');
       setDescription('');
       setFiles([]);
       await loadBaselines();
+      onBaselineChanged?.();
     } catch (err: any) {
-      alert('Calibration error: ' + err.message);
+      setErrorMessage('Calibration error: ' + err.message);
     } finally {
       setLoading(false);
     }
@@ -84,6 +94,15 @@ export const BaselineManagerPage: React.FC = () => {
 
   return (
     <div className="space-y-6">
+      {/* Error Alert */}
+      {errorMessage && (
+        <div className="p-3.5 rounded-xl bg-rose-950/40 border border-rose-800/60 flex items-center gap-2.5 text-xs text-rose-200">
+          <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" />
+          <span className="flex-1 font-mono">{errorMessage}</span>
+          <button onClick={() => setErrorMessage(null)} className="text-rose-400 hover:text-white font-bold">✕</button>
+        </div>
+      )}
+
       {/* Title & Tabs */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-2 border-b border-[#1f293d]">
         <div>
@@ -223,8 +242,8 @@ export const BaselineManagerPage: React.FC = () => {
                         <th className="pb-2 font-medium">METRIC</th>
                         <th className="pb-2 font-medium">MEDIAN</th>
                         <th className="pb-2 font-medium">MAD</th>
-                        <th className="pb-2 font-medium">5TH %ILE</th>
-                        <th className="pb-2 font-medium">95TH %ILE</th>
+                        <th className="pb-2 font-medium">10TH %ILE</th>
+                        <th className="pb-2 font-medium">90TH %ILE</th>
                         <th className="pb-2 font-medium">RANGE [MIN, MAX]</th>
                       </tr>
                     </thead>
@@ -236,8 +255,8 @@ export const BaselineManagerPage: React.FC = () => {
                           </td>
                           <td className="py-2.5 text-cyan-400 font-bold">{metricStats.median}</td>
                           <td className="py-2.5 text-slate-400">{metricStats.mad}</td>
-                          <td className="py-2.5 text-slate-300">{metricStats.p5}</td>
-                          <td className="py-2.5 text-slate-300">{metricStats.p95}</td>
+                          <td className="py-2.5 text-slate-300">{metricStats.p10 ?? metricStats.p5}</td>
+                          <td className="py-2.5 text-slate-300">{metricStats.p90 ?? metricStats.p95}</td>
                           <td className="py-2.5 text-slate-400">[{metricStats.min}, {metricStats.max}]</td>
                         </tr>
                       ))}
@@ -294,7 +313,7 @@ export const BaselineManagerPage: React.FC = () => {
                 <input
                   type="file"
                   multiple
-                  accept={activeTab === 'image' ? 'image/*' : 'audio/*'}
+                  accept={activeTab === 'image' ? 'image/*' : 'audio/*,.wav,.mp3,.flac,.ogg,.m4a'}
                   onChange={(e) => {
                     if (e.target.files) setFiles(Array.from(e.target.files));
                   }}

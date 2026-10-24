@@ -11,12 +11,16 @@ import { WarningCard } from '../components/WarningCard';
 
 interface OverviewPageProps {
   status: SystemOverallStatus | null;
+  isOnline?: boolean;
+  lastUpdated?: Date;
   onNavigate: (tab: string) => void;
   onRefresh: () => void;
 }
 
 export const OverviewPage: React.FC<OverviewPageProps> = ({
   status,
+  isOnline = true,
+  lastUpdated,
   onNavigate,
   onRefresh
 }) => {
@@ -39,23 +43,46 @@ export const OverviewPage: React.FC<OverviewPageProps> = ({
     }
   };
 
-  const overallScore = status?.overall_reliability_score ?? 100;
-  const imageScore = status?.image_reliability_score ?? 100;
-  const audioScore = status?.audio_reliability_score ?? 100;
+  const overallScore = isOnline ? (status?.overall_reliability_score ?? 100) : 0;
+  const imageScore = isOnline ? (status?.image_reliability_score ?? 100) : 0;
+  const audioScore = isOnline ? (status?.audio_reliability_score ?? 100) : 0;
+  const timeFormatted = lastUpdated ? lastUpdated.toLocaleTimeString() : (status?.last_updated_formatted || 'Connecting...');
 
   return (
     <div className="space-y-6">
+      {/* Offline Alert Banner */}
+      {!isOnline && (
+        <div className="p-4 rounded-xl bg-rose-950/40 border border-rose-800/60 flex items-center gap-3 animate-pulse">
+          <AlertTriangle className="w-5 h-5 text-rose-400 shrink-0" />
+          <div className="flex-1">
+            <p className="text-xs font-semibold text-rose-200">Backend Monitoring Service Disconnected</p>
+            <p className="text-[11px] text-rose-300/80 mt-0.5">
+              Unable to reach local engine daemon at 127.0.0.1:8000. Active perception telemetry is paused. Showing last cached state; system will automatically reconnect.
+            </p>
+          </div>
+          <button
+            onClick={() => { onRefresh(); loadEvents(); }}
+            className="px-3 py-1 rounded bg-rose-900/60 hover:bg-rose-800 text-xs font-mono text-rose-200 border border-rose-700/60 transition"
+          >
+            Retry Now
+          </button>
+        </div>
+      )}
+
       {/* Top Banner & Quick Metrics */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-2 border-b border-[#1f293d]">
         <div>
           <h2 className="text-xl font-bold tracking-tight text-white flex items-center gap-2.5">
             Reliability Overview Dashboard
-            <span className="text-xs px-2.5 py-0.5 rounded-full bg-blue-500/10 border border-blue-500/30 text-blue-400 font-mono font-medium">
-              Real-Time
+            <span className={`text-xs px-2.5 py-0.5 rounded-full border font-mono font-medium ${
+              isOnline ? 'bg-blue-500/10 border-blue-500/30 text-blue-400' : 'bg-rose-500/10 border-rose-500/30 text-rose-400'
+            }`}>
+              {isOnline ? 'Real-Time Telemetry' : 'Disconnected'}
             </span>
           </h2>
           <p className="text-xs text-slate-400 mt-1">
             Continuous on-device perception monitoring for input degradation and model reasoning unreliability.
+            <span className="ml-2 text-slate-500 font-mono">Last update: {timeFormatted}</span>
           </p>
         </div>
 
@@ -79,7 +106,11 @@ export const OverviewPage: React.FC<OverviewPageProps> = ({
           <ReliabilityGauge score={overallScore} label="Global Health Index" size={130} showRisk />
           <div className="w-full mt-2 pt-2 border-t border-slate-800/80 flex justify-between text-[11px] text-slate-400 font-mono">
             <span>State:</span>
-            <span className="uppercase font-bold text-white">{status?.overall_state || 'NORMAL'}</span>
+            <span className={`uppercase font-bold ${
+              !isOnline ? 'text-rose-400' : status?.overall_state === 'warning' ? 'text-rose-400' : status?.overall_state === 'caution' ? 'text-amber-400' : 'text-emerald-400'
+            }`}>
+              {isOnline ? (status?.overall_state || 'NORMAL') : 'OFFLINE'}
+            </span>
           </div>
         </div>
 
@@ -90,7 +121,24 @@ export const OverviewPage: React.FC<OverviewPageProps> = ({
             <Eye className="w-4 h-4 text-cyan-400" />
           </div>
           <ReliabilityGauge score={imageScore} label="Image Quality Score" size={130} />
-          <div className="w-full mt-2 pt-2 border-t border-slate-800/80 flex justify-between items-center text-[11px] font-mono">
+          
+          <div className="w-full my-1 px-1 text-[10px] text-slate-400 flex flex-col gap-0.5 border-t border-slate-800/50 pt-1.5 font-mono">
+            <div className="flex justify-between truncate">
+              <span className="text-slate-500">Baseline:</span>
+              <span className="text-slate-300 truncate max-w-[120px]" title={status?.active_image_baseline?.name}>
+                {status?.active_image_baseline?.name || 'Default Clear Room'}
+              </span>
+            </div>
+            {status?.last_image_metrics && (
+              <div className="flex justify-between text-slate-400 text-[9px]">
+                <span>Bri: {status.last_image_metrics.brightness.toFixed(0)}</span>
+                <span>Sha: {status.last_image_metrics.sharpness.toFixed(0)}</span>
+                <span>Con: {status.last_image_metrics.contrast.toFixed(0)}</span>
+              </div>
+            )}
+          </div>
+
+          <div className="w-full mt-1 pt-1.5 border-t border-slate-800/80 flex justify-between items-center text-[11px] font-mono">
             <button
               onClick={() => onNavigate('image-lab')}
               className="text-cyan-400 hover:text-cyan-300 flex items-center gap-1 text-[11px]"
@@ -98,9 +146,9 @@ export const OverviewPage: React.FC<OverviewPageProps> = ({
               Open Image Lab <ArrowUpRight className="w-3 h-3" />
             </button>
             <span className={`px-1.5 py-0.5 rounded text-[10px] uppercase font-bold ${
-              status?.image_state === 'warning' ? 'bg-rose-500/20 text-rose-400' : 'bg-emerald-500/20 text-emerald-400'
+              !isOnline ? 'bg-slate-800 text-slate-400' : status?.image_state === 'warning' ? 'bg-rose-500/20 text-rose-400' : 'bg-emerald-500/20 text-emerald-400'
             }`}>
-              {status?.image_state || 'NORMAL'}
+              {isOnline ? (status?.image_state || 'NORMAL') : 'OFFLINE'}
             </span>
           </div>
         </div>
@@ -112,7 +160,24 @@ export const OverviewPage: React.FC<OverviewPageProps> = ({
             <Mic className="w-4 h-4 text-violet-400" />
           </div>
           <ReliabilityGauge score={audioScore} label="Speech Suitability Score" size={130} />
-          <div className="w-full mt-2 pt-2 border-t border-slate-800/80 flex justify-between items-center text-[11px] font-mono">
+
+          <div className="w-full my-1 px-1 text-[10px] text-slate-400 flex flex-col gap-0.5 border-t border-slate-800/50 pt-1.5 font-mono">
+            <div className="flex justify-between truncate">
+              <span className="text-slate-500">Baseline:</span>
+              <span className="text-slate-300 truncate max-w-[120px]" title={status?.active_audio_baseline?.name}>
+                {status?.active_audio_baseline?.name || 'Quiet Studio'}
+              </span>
+            </div>
+            {status?.last_audio_metrics && (
+              <div className="flex justify-between text-slate-400 text-[9px]">
+                <span>RMS: {status.last_audio_metrics.rms_dbfs.toFixed(0)}dB</span>
+                <span>SNR: {status.last_audio_metrics.snr_db.toFixed(0)}dB</span>
+                <span>Clip: {status.last_audio_metrics.clipping_pct.toFixed(1)}%</span>
+              </div>
+            )}
+          </div>
+
+          <div className="w-full mt-1 pt-1.5 border-t border-slate-800/80 flex justify-between items-center text-[11px] font-mono">
             <button
               onClick={() => onNavigate('audio-lab')}
               className="text-violet-400 hover:text-violet-300 flex items-center gap-1 text-[11px]"
@@ -120,9 +185,9 @@ export const OverviewPage: React.FC<OverviewPageProps> = ({
               Open Audio Lab <ArrowUpRight className="w-3 h-3" />
             </button>
             <span className={`px-1.5 py-0.5 rounded text-[10px] uppercase font-bold ${
-              status?.audio_state === 'warning' ? 'bg-rose-500/20 text-rose-400' : 'bg-emerald-500/20 text-emerald-400'
+              !isOnline ? 'bg-slate-800 text-slate-400' : status?.audio_state === 'warning' ? 'bg-rose-500/20 text-rose-400' : 'bg-emerald-500/20 text-emerald-400'
             }`}>
-              {status?.audio_state || 'NORMAL'}
+              {isOnline ? (status?.audio_state || 'NORMAL') : 'OFFLINE'}
             </span>
           </div>
         </div>
@@ -134,10 +199,14 @@ export const OverviewPage: React.FC<OverviewPageProps> = ({
             <Bot className="w-4 h-4 text-emerald-400" />
           </div>
           <div className="my-auto py-2 text-center">
-            <div className="w-12 h-12 rounded-full bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center mx-auto text-emerald-400 mb-2">
+            <div className={`w-12 h-12 rounded-full flex items-center justify-center mx-auto mb-2 ${
+              isOnline ? 'bg-emerald-500/10 border border-emerald-500/30 text-emerald-400' : 'bg-slate-800 border border-slate-700 text-slate-400'
+            }`}>
               <ShieldCheck className="w-6 h-6" />
             </div>
-            <p className="text-xs font-semibold text-white">Monitoring Coupled</p>
+            <p className="text-xs font-semibold text-white">
+              {status?.active_provider ? `Provider: ${status.active_provider.toUpperCase()}` : 'Coupled Guard'}
+            </p>
             <p className="text-[11px] text-slate-400 mt-0.5">Input degradation fed to prompt guard</p>
           </div>
           <div className="w-full mt-2 pt-2 border-t border-slate-800/80 flex justify-between items-center text-[11px] font-mono">
@@ -147,7 +216,9 @@ export const OverviewPage: React.FC<OverviewPageProps> = ({
             >
               Launch Console <ArrowUpRight className="w-3 h-3" />
             </button>
-            <span className="text-slate-400">READY</span>
+            <span className={status?.llm_state === 'warning' ? 'text-rose-400 font-bold' : 'text-slate-400'}>
+              {isOnline ? (status?.llm_state?.toUpperCase() || 'READY') : 'OFFLINE'}
+            </span>
           </div>
         </div>
       </div>

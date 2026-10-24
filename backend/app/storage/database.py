@@ -106,7 +106,7 @@ def init_db():
     # Insert default settings if not exists
     default_settings = {
         "llm_provider": "mock",
-        "ollama_url": "http://127.0.0.1:1434",
+        "ollama_url": "http://127.0.0.1:11434",
         "openai_compat_url": "http://127.0.0.1:1234/v1",
         "active_model": "mock-llama-3b",
         "camera_sample_fps": "2",
@@ -118,6 +118,9 @@ def init_db():
         "hysteresis_threshold": "3",
         "data_retention_days": "30"
     }
+
+    # Fix legacy typo in ollama_url if present
+    cursor.execute("UPDATE settings SET value = 'http://127.0.0.1:11434' WHERE key = 'ollama_url' AND value = 'http://127.0.0.1:1434'")
 
     for k, v in default_settings.items():
         cursor.execute("SELECT key FROM settings WHERE key = ?", (k,))

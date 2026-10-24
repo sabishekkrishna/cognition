@@ -33,6 +33,37 @@ from ..storage.database import (
     get_all_settings, set_setting, get_recent_events, clear_events,
     get_baselines, get_active_baseline, set_active_baseline, delete_baseline
 )
+from ..llm_providers.base import parse_and_validate_local_endpoint
+from pydantic import BaseModel
+import httpx
+
+class DiagnosticStepResult(BaseModel):
+    step_number: int
+    name: str
+    status: str # 'pass', 'fail', 'warn'
+    latency_ms: float
+    message: str
+    remedy: Optional[str] = None
+
+class LLMDiagnosticReport(BaseModel):
+    provider: str
+    target_url: str
+    host: str
+    port: int
+    overall_status: str # 'connected', 'warning', 'failed'
+    steps: List[DiagnosticStepResult]
+    discovered_models: List[str]
+    sample_response: Optional[str] = None
+    saved_as_active: bool = False
+
+class LLMConnectionTestRequest(BaseModel):
+    provider: str = "ollama" # ollama, lm_studio, llama_cpp, mock
+    base_url: Optional[str] = None
+    host: Optional[str] = None
+    port: Optional[int] = None
+    model: Optional[str] = None
+    allow_remote: bool = False
+    save_if_successful: bool = False
 
 api_router = APIRouter()
 
@@ -90,7 +121,7 @@ async def analyze_image_endpoint(file: UploadFile = File(...)):
 
     # 3. Baseline comparison & scoring via Unified Engine
     engine = get_monitoring_engine()
-    res = engine.process_image_frame(metrics, predictions)
+    res = engine.process_image_frame(metrics, predictions, is_stream=False)
 
     baseline = BaselineManager.get_or_create_default_image_baseline()
 
@@ -136,7 +167,7 @@ async def degrade_and_analyze_image(
     predictions = classifier.predict(degraded_bgr, top_k=5)
 
     engine = get_monitoring_engine()
-    res = engine.process_image_frame(metrics, predictions)
+    res = engine.process_image_frame(metrics, predictions, is_stream=False)
     baseline = BaselineManager.get_or_create_default_image_baseline()
 
     # Also analyze clean original for side-by-side comparison
@@ -189,7 +220,13 @@ async def get_sample_image():
 @api_router.post("/audio/analyze", response_model=AudioAnalysisResponse)
 async def analyze_audio_endpoint(file: UploadFile = File(...)):
     content = await file.read()
-    samples, sr = parse_audio_data(content)
+    try:
+        samples, sr = parse_audio_data(content, filename=file.filename)
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Audio decoding failure for '{file.filename}': {str(e)}"
+        )
 
     # 1. Acoustic measurements
     metrics = analyze_audio_quality(samples, sr)
@@ -207,7 +244,7 @@ async def analyze_audio_endpoint(file: UploadFile = File(...)):
 
     # 3. Unified engine evaluation
     engine = get_monitoring_engine()
-    res = engine.process_audio_chunk(metrics, classification)
+    res = engine.process_audio_chunk(metrics, classification, is_stream=False)
     baseline = BaselineManager.get_or_create_default_audio_baseline()
 
     return AudioAnalysisResponse(
@@ -231,7 +268,13 @@ async def degrade_and_analyze_audio(
     clipping_gain: float = Form(1.0)
 ):
     content = await file.read()
-    orig_samples, sr = parse_audio_data(content)
+    try:
+        orig_samples, sr = parse_audio_data(content, filename=file.filename)
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Audio decoding failure for '{file.filename}': {str(e)}"
+        )
 
     config = AudioDegradationConfig(
         volume_factor=volume_factor,
@@ -255,7 +298,7 @@ async def degrade_and_analyze_audio(
     )
 
     engine = get_monitoring_engine()
-    res = engine.process_audio_chunk(metrics, classification)
+    res = engine.process_audio_chunk(metrics, classification, is_stream=False)
     baseline = BaselineManager.get_or_create_default_audio_baseline()
 
     # Original analysis
@@ -341,6 +384,374 @@ async def list_llm_models(provider: Optional[str] = None):
         "provider": prov.get_provider_name(),
         "models": models
     }
+
+@api_router.post("/llm/test-connection", response_model=LLMDiagnosticReport)
+async def test_llm_connection_diagnostic(req: LLMConnectionTestRequest):
+    steps: List[DiagnosticStepResult] = []
+    discovered_models: List[str] = []
+    sample_response: Optional[str] = None
+    saved_as_active = False
+
+    # Mock provider fast-path
+    if req.provider == "mock":
+        steps.append(DiagnosticStepResult(step_number=1, name="Address & Port Validation", status="pass", latency_ms=0.1, message="Internal synthetic offline provider validated."))
+        steps.append(DiagnosticStepResult(step_number=2, name="Server Reachability Probe", status="pass", latency_ms=0.1, message="In-process mock server is always reachable."))
+        steps.append(DiagnosticStepResult(step_number=3, name="API Compatibility", status="pass", latency_ms=0.1, message="Native Python mock implementation active."))
+        steps.append(DiagnosticStepResult(step_number=4, name="Model Discovery", status="pass", latency_ms=0.1, message="Discovered 3 virtual mock models: mock-phi-3, mock-llama-3, mock-mistral-7b."))
+        steps.append(DiagnosticStepResult(step_number=5, name="Test Inference", status="pass", latency_ms=1.2, message="Synthetic test inference verified."))
+        if req.save_if_successful:
+            set_setting("llm_provider", "mock")
+            get_provider_registry().set_active_provider("mock")
+            saved_as_active = True
+        return LLMDiagnosticReport(
+            provider="mock",
+            target_url="internal://mock",
+            host="127.0.0.1",
+            port=0,
+            overall_status="connected",
+            steps=steps,
+            discovered_models=["mock-phi-3", "mock-llama-3", "mock-mistral-7b"],
+            sample_response="Mock generation operational.",
+            saved_as_active=saved_as_active
+        )
+
+    # 1. Determine raw target address
+    if req.host and req.port:
+        raw_addr = f"http://{req.host}:{req.port}"
+    elif req.base_url:
+        raw_addr = req.base_url
+    else:
+        settings = get_all_settings()
+        if req.provider == "ollama":
+            raw_addr = settings.get("ollama_url", "http://127.0.0.1:11434")
+        elif req.provider == "lm_studio":
+            raw_addr = settings.get("openai_compat_url", "http://127.0.0.1:1234/v1")
+        else: # llama_cpp
+            raw_addr = settings.get("llama_cpp_url", "http://127.0.0.1:8080/v1")
+
+    # Step 1: Address and Port Validation
+    t0 = time.time()
+    def_port = 11434 if req.provider == "ollama" else 1234 if req.provider == "lm_studio" else 8080
+    is_valid, canon_url, host, err_msg, port = parse_and_validate_local_endpoint(
+        raw_addr, default_port=def_port, allow_remote=req.allow_remote
+    )
+    s1_lat = round((time.time() - t0) * 1000.0, 2)
+
+    if not is_valid:
+        steps.append(DiagnosticStepResult(
+            step_number=1,
+            name="Address & Port Validation",
+            status="fail",
+            latency_ms=s1_lat,
+            message=err_msg,
+            remedy="Check host and port syntax. For security, only loopback addresses (127.0.0.1, localhost) are permitted unless 'allow_remote' is enabled."
+        ))
+        return LLMDiagnosticReport(
+            provider=req.provider,
+            target_url=raw_addr,
+            host=host or "unknown",
+            port=port,
+            overall_status="failed",
+            steps=steps,
+            discovered_models=[]
+        )
+
+    steps.append(DiagnosticStepResult(
+        step_number=1,
+        name="Address & Port Validation",
+        status="pass",
+        latency_ms=s1_lat,
+        message=f"Canonical URL '{canon_url}' validated (Host: {host}, Port: {port}). SSRF check passed."
+    ))
+
+    # Step 2: Server Reachability Probe
+    t0 = time.time()
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            probe_res = await client.get(canon_url)
+            s2_lat = round((time.time() - t0) * 1000.0, 2)
+            steps.append(DiagnosticStepResult(
+                step_number=2,
+                name="Server Reachability Probe",
+                status="pass",
+                latency_ms=s2_lat,
+                message=f"Host responded with HTTP {probe_res.status_code} in {s2_lat}ms."
+            ))
+    except httpx.ConnectError:
+        s2_lat = round((time.time() - t0) * 1000.0, 2)
+        remedy_msg = (
+            f"Ollama server is not running on port {port}. Open terminal and run 'ollama serve'."
+            if req.provider == "ollama" else
+            f"Local server is not running on port {port}. Ensure {req.provider} is running and listening on port {port}."
+        )
+        steps.append(DiagnosticStepResult(
+            step_number=2,
+            name="Server Reachability Probe",
+            status="fail",
+            latency_ms=s2_lat,
+            message=f"Connection refused at {canon_url}. No service is listening on port {port}.",
+            remedy=remedy_msg
+        ))
+        return LLMDiagnosticReport(
+            provider=req.provider,
+            target_url=canon_url,
+            host=host,
+            port=port,
+            overall_status="failed",
+            steps=steps,
+            discovered_models=[]
+        )
+    except httpx.TimeoutException:
+        s2_lat = round((time.time() - t0) * 1000.0, 2)
+        steps.append(DiagnosticStepResult(
+            step_number=2,
+            name="Server Reachability Probe",
+            status="fail",
+            latency_ms=s2_lat,
+            message=f"Connection timed out after 3.0 seconds at {canon_url}.",
+            remedy="Check whether a local firewall is blocking the port or the host is unresponsive."
+        ))
+        return LLMDiagnosticReport(
+            provider=req.provider,
+            target_url=canon_url,
+            host=host,
+            port=port,
+            overall_status="failed",
+            steps=steps,
+            discovered_models=[]
+        )
+    except Exception as e:
+        s2_lat = round((time.time() - t0) * 1000.0, 2)
+        steps.append(DiagnosticStepResult(
+            step_number=2,
+            name="Server Reachability Probe",
+            status="fail",
+            latency_ms=s2_lat,
+            message=f"Network error: {str(e)}",
+            remedy="Verify endpoint reachability and network adapters."
+        ))
+        return LLMDiagnosticReport(
+            provider=req.provider,
+            target_url=canon_url,
+            host=host,
+            port=port,
+            overall_status="failed",
+            steps=steps,
+            discovered_models=[]
+        )
+
+    # Step 3: API Compatibility Check & Step 4: Model Discovery
+    t0 = time.time()
+    try:
+        async with httpx.AsyncClient(timeout=4.0) as client:
+            if req.provider == "ollama":
+                tags_url = f"{canon_url}/api/tags"
+                res = await client.get(tags_url)
+                s3_lat = round((time.time() - t0) * 1000.0, 2)
+                if res.status_code == 200:
+                    steps.append(DiagnosticStepResult(
+                        step_number=3,
+                        name="API Compatibility",
+                        status="pass",
+                        latency_ms=s3_lat,
+                        message=f"Ollama native API endpoint {tags_url} verified."
+                    ))
+                    data = res.json()
+                    discovered_models = [m.get("name", "unknown") for m in data.get("models", [])]
+                else:
+                    steps.append(DiagnosticStepResult(
+                        step_number=3,
+                        name="API Compatibility",
+                        status="fail",
+                        latency_ms=s3_lat,
+                        message=f"Endpoint {tags_url} returned HTTP {res.status_code}: {res.text[:120]}",
+                        remedy="Confirm this is an Ollama daemon. If running LM Studio or llama.cpp, select OpenAI-compatible provider."
+                    ))
+                    return LLMDiagnosticReport(
+                        provider=req.provider, target_url=canon_url, host=host, port=port,
+                        overall_status="failed", steps=steps, discovered_models=[]
+                    )
+            else: # OpenAI compatible
+                models_url = f"{canon_url}/models"
+                if not canon_url.endswith("/v1") and "/v1" not in canon_url:
+                    models_url = f"{canon_url}/v1/models"
+                res = await client.get(models_url)
+                s3_lat = round((time.time() - t0) * 1000.0, 2)
+                if res.status_code == 200:
+                    steps.append(DiagnosticStepResult(
+                        step_number=3,
+                        name="API Compatibility",
+                        status="pass",
+                        latency_ms=s3_lat,
+                        message=f"OpenAI-compatible models endpoint {models_url} verified."
+                    ))
+                    data = res.json()
+                    discovered_models = [m.get("id", "unknown") for m in data.get("data", [])]
+                else:
+                    steps.append(DiagnosticStepResult(
+                        step_number=3,
+                        name="API Compatibility",
+                        status="fail",
+                        latency_ms=s3_lat,
+                        message=f"Endpoint {models_url} returned HTTP {res.status_code}: {res.text[:120]}",
+                        remedy="Check server path. Many servers require a '/v1' prefix like 'http://127.0.0.1:1234/v1'."
+                    ))
+                    return LLMDiagnosticReport(
+                        provider=req.provider, target_url=canon_url, host=host, port=port,
+                        overall_status="failed", steps=steps, discovered_models=[]
+                    )
+    except Exception as e:
+        s3_lat = round((time.time() - t0) * 1000.0, 2)
+        steps.append(DiagnosticStepResult(
+            step_number=3,
+            name="API Compatibility",
+            status="fail",
+            latency_ms=s3_lat,
+            message=f"API check exception: {str(e)}",
+            remedy="Verify server API specification."
+        ))
+        return LLMDiagnosticReport(
+            provider=req.provider, target_url=canon_url, host=host, port=port,
+            overall_status="failed", steps=steps, discovered_models=[]
+        )
+
+    # Step 4: Model Discovery validation
+    if len(discovered_models) == 0:
+        steps.append(DiagnosticStepResult(
+            step_number=4,
+            name="Model Discovery",
+            status="warn",
+            latency_ms=0.5,
+            message="Server connected successfully, but 0 models were discovered.",
+            remedy=(
+                "Pull a local model in terminal: 'ollama pull llama3' or 'ollama pull mistral'."
+                if req.provider == "ollama" else
+                "Load a model into memory in LM Studio or restart llama-server with a model file."
+            )
+        ))
+    else:
+        steps.append(DiagnosticStepResult(
+            step_number=4,
+            name="Model Discovery",
+            status="pass",
+            latency_ms=0.5,
+            message=f"Discovered {len(discovered_models)} model(s): {', '.join(discovered_models[:4])}"
+        ))
+
+    # Step 5: Test Inference
+    t0 = time.time()
+    test_model = req.model if (req.model and req.model in discovered_models) else (discovered_models[0] if discovered_models else None)
+
+    if not test_model:
+        steps.append(DiagnosticStepResult(
+            step_number=5,
+            name="Test Inference",
+            status="warn",
+            latency_ms=0.0,
+            message="Test inference skipped because no active model is loaded on the provider.",
+            remedy="Install or load a model to test prompt generation."
+        ))
+    else:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                if req.provider == "ollama":
+                    gen_url = f"{canon_url}/api/generate"
+                    gen_res = await client.post(gen_url, json={
+                        "model": test_model,
+                        "prompt": "Say READY",
+                        "stream": False,
+                        "options": {"num_predict": 8, "temperature": 0.0}
+                    })
+                    s5_lat = round((time.time() - t0) * 1000.0, 2)
+                    if gen_res.status_code == 200:
+                        sample_response = gen_res.json().get("response", "").strip()
+                        steps.append(DiagnosticStepResult(
+                            step_number=5,
+                            name="Test Inference",
+                            status="pass",
+                            latency_ms=s5_lat,
+                            message=f"Inference succeeded on '{test_model}' in {s5_lat}ms: '{sample_response}'"
+                        ))
+                    else:
+                        steps.append(DiagnosticStepResult(
+                            step_number=5,
+                            name="Test Inference",
+                            status="warn",
+                            latency_ms=s5_lat,
+                            message=f"Inference call returned HTTP {gen_res.status_code}: {gen_res.text[:100]}",
+                            remedy="Model may need more GPU memory or is still loading."
+                        ))
+                else: # OpenAI
+                    chat_url = f"{canon_url}/chat/completions"
+                    if not canon_url.endswith("/v1") and "/v1" not in canon_url:
+                        chat_url = f"{canon_url}/v1/chat/completions"
+                    gen_res = await client.post(chat_url, json={
+                        "model": test_model,
+                        "messages": [{"role": "user", "content": "Say READY"}],
+                        "max_tokens": 8,
+                        "temperature": 0.0
+                    })
+                    s5_lat = round((time.time() - t0) * 1000.0, 2)
+                    if gen_res.status_code == 200:
+                        data = gen_res.json()
+                        sample_response = data["choices"][0]["message"]["content"].strip()
+                        steps.append(DiagnosticStepResult(
+                            step_number=5,
+                            name="Test Inference",
+                            status="pass",
+                            latency_ms=s5_lat,
+                            message=f"Inference succeeded on '{test_model}' in {s5_lat}ms: '{sample_response}'"
+                        ))
+                    else:
+                        steps.append(DiagnosticStepResult(
+                            step_number=5,
+                            name="Test Inference",
+                            status="warn",
+                            latency_ms=s5_lat,
+                            message=f"Inference call returned HTTP {gen_res.status_code}: {gen_res.text[:100]}",
+                            remedy="Check server logs and GPU memory allocation."
+                        ))
+        except Exception as e:
+            s5_lat = round((time.time() - t0) * 1000.0, 2)
+            steps.append(DiagnosticStepResult(
+                step_number=5,
+                name="Test Inference",
+                status="warn",
+                latency_ms=s5_lat,
+                message=f"Inference test warning: {str(e)}",
+                remedy="Model response timed out or was interrupted. Server remains reachable."
+            ))
+
+    has_fail = any(s.status == "fail" for s in steps)
+    has_warn = any(s.status == "warn" for s in steps)
+    overall_status = "failed" if has_fail else ("warning" if has_warn else "connected")
+
+    # Save to database and registry if requested and successfully connected
+    if req.save_if_successful and overall_status in ["connected", "warning"]:
+        if req.provider == "ollama":
+            set_setting("ollama_url", canon_url)
+        elif req.provider == "lm_studio":
+            set_setting("openai_compat_url", canon_url)
+        elif req.provider == "llama_cpp":
+            set_setting("llama_cpp_url", canon_url)
+        set_setting("llm_provider", req.provider)
+
+        reg = get_provider_registry()
+        reg.update_provider_url(req.provider, canon_url)
+        reg.set_active_provider(req.provider)
+        saved_as_active = True
+
+    return LLMDiagnosticReport(
+        provider=req.provider,
+        target_url=canon_url,
+        host=host,
+        port=port,
+        overall_status=overall_status,
+        steps=steps,
+        discovered_models=discovered_models,
+        sample_response=sample_response,
+        saved_as_active=saved_as_active
+    )
 
 @api_router.post("/llm/generate", response_model=LLMResponseInfo)
 async def generate_llm_response(req: LLMGenerateRequest):
@@ -470,11 +881,21 @@ async def create_audio_baseline_endpoint(
         raise HTTPException(status_code=400, detail="At least one audio file is required to calibrate a baseline.")
 
     metrics_list = []
+    errors = []
     for f in files:
         b = await f.read()
-        samples, sr = parse_audio_data(b)
-        m = analyze_audio_quality(samples, sr)
-        metrics_list.append(m)
+        try:
+            samples, sr = parse_audio_data(b, filename=f.filename)
+            m = analyze_audio_quality(samples, sr)
+            metrics_list.append(m)
+        except Exception as e:
+            errors.append(f"'{f.filename}': {str(e)}")
+
+    if len(metrics_list) == 0:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not calibrate baseline. None of the {len(files)} files could be decoded. Errors: {'; '.join(errors)}"
+        )
 
     baseline = BaselineManager.calibrate_audio_baseline(
         name=name,
@@ -489,6 +910,13 @@ async def activate_baseline_endpoint(baseline_id: str):
     ok = set_active_baseline(baseline_id)
     if not ok:
         raise HTTPException(status_code=404, detail="Baseline not found.")
+    
+    # Notify engine based on baseline type
+    all_b = get_baselines()
+    target = next((b for b in all_b if b.id == baseline_id), None)
+    if target:
+        get_monitoring_engine().notify_baseline_updated(target.type)
+
     return {"status": "activated", "baseline_id": baseline_id}
 
 @api_router.delete("/baselines/{baseline_id}")
@@ -556,6 +984,16 @@ async def clear_events_endpoint(confirm: bool = Query(False)):
     clear_events()
     return {"status": "cleared"}
 
+@api_router.post("/monitor/state")
+async def set_monitor_active_endpoint(active: bool = Body(..., embed=True)):
+    engine = get_monitoring_engine()
+    engine.set_monitoring_active(active)
+    return {
+        "status": "updated",
+        "monitoring_active": active,
+        "overall": engine.get_system_overall_status()
+    }
+
 @api_router.get("/settings")
 async def get_settings_endpoint():
     return get_all_settings()
@@ -564,4 +1002,5 @@ async def get_settings_endpoint():
 async def update_settings_endpoint(settings: Dict[str, str] = Body(...)):
     for k, v in settings.items():
         set_setting(k, str(v))
+    get_provider_registry().sync_from_settings()
     return {"status": "saved", "settings": get_all_settings()}

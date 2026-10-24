@@ -164,3 +164,11 @@ class SystemOverallStatus(BaseModel):
     active_warnings: List[MetricWarning]
     recent_events_count: int
     timestamp: float
+    last_updated_formatted: Optional[str] = None
+    monitoring_active: bool = True
+    active_image_baseline: Optional[Dict[str, Any]] = None
+    active_audio_baseline: Optional[Dict[str, Any]] = None
+    active_model: Optional[str] = None
+    active_provider: Optional[str] = None
+    last_image_metrics: Optional[ImageQualityMetrics] = None
+    last_audio_metrics: Optional[AudioQualityMetrics] = None

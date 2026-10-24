@@ -17,17 +17,70 @@ export const App: React.FC = () => {
   const [activeTab, setActiveTab] = useState<string>('overview');
   const [systemStatus, setSystemStatus] = useState<SystemOverallStatus | null>(null);
   const [activeProviderName, setActiveProviderName] = useState<string>('Ollama / Local');
+  const [isBackendOnline, setIsBackendOnline] = useState<boolean>(true);
+  const [lastUpdated, setLastUpdated] = useState<Date>(new Date());
 
   useEffect(() => {
     fetchStatus();
-    const interval = setInterval(fetchStatus, 4000);
-    return () => clearInterval(interval);
+    const interval = setInterval(fetchStatus, 3500);
+
+    // WebSocket real-time subscription
+    let ws: WebSocket | null = null;
+    let wsReconnectTimeout: any = null;
+
+    const connectWebSocket = () => {
+      try {
+        ws = new WebSocket('ws://127.0.0.1:8000/ws/monitor');
+
+        ws.onopen = () => {
+          setIsBackendOnline(true);
+          ws?.send(JSON.stringify({ type: 'get_status' }));
+        };
+
+        ws.onmessage = (event) => {
+          try {
+            const data = JSON.parse(event.data);
+            if (data.type === 'status_update' && data.overall) {
+              setSystemStatus(data.overall);
+              setIsBackendOnline(true);
+              setLastUpdated(new Date());
+            } else if ((data.type === 'image_update' || data.type === 'audio_update') && data.overall) {
+              setSystemStatus(data.overall);
+              setIsBackendOnline(true);
+              setLastUpdated(new Date());
+            }
+          } catch (e) {
+            // ignore malformed ws messages
+          }
+        };
+
+        ws.onerror = () => {
+          // let fetchStatus handle offline reporting
+        };
+
+        ws.onclose = () => {
+          wsReconnectTimeout = setTimeout(connectWebSocket, 4000);
+        };
+      } catch (err) {
+        // ws unsupported or blocked
+      }
+    };
+
+    connectWebSocket();
+
+    return () => {
+      clearInterval(interval);
+      if (wsReconnectTimeout) clearTimeout(wsReconnectTimeout);
+      if (ws) ws.close();
+    };
   }, []);
 
   const fetchStatus = async () => {
     try {
       const statusData = await api.getStatus();
       setSystemStatus(statusData);
+      setIsBackendOnline(true);
+      setLastUpdated(new Date());
 
       const provData = await api.getLLMProviders();
       const current = provData.providers?.find((p: any) => p.id === provData.active_provider);
@@ -35,7 +88,21 @@ export const App: React.FC = () => {
         setActiveProviderName(current.name.split(' ')[0]);
       }
     } catch (err) {
-      // Backend may be starting or offline
+      // Backend disconnected / offline: DO NOT display falsely healthy status!
+      setIsBackendOnline(false);
+      setSystemStatus((prev) => ({
+        overall_state: 'unavailable',
+        overall_reliability_score: 0,
+        image_state: 'unavailable',
+        image_reliability_score: 0,
+        audio_state: 'unavailable',
+        audio_reliability_score: 0,
+        llm_state: 'unavailable',
+        active_warnings: prev?.active_warnings || [],
+        recent_events_count: prev?.recent_events_count || 0,
+        timestamp: Date.now() / 1000,
+        last_updated_formatted: 'Backend Disconnected'
+      }));
     }
   };
 
@@ -45,6 +112,8 @@ export const App: React.FC = () => {
         return (
           <OverviewPage
             status={systemStatus}
+            isOnline={isBackendOnline}
+            lastUpdated={lastUpdated}
             onNavigate={(tab) => setActiveTab(tab)}
             onRefresh={fetchStatus}
           />
@@ -67,17 +136,19 @@ export const App: React.FC = () => {
           />
         );
       case 'baselines':
-        return <BaselineManagerPage />;
+        return <BaselineManagerPage onBaselineChanged={fetchStatus} />;
       case 'datasets':
         return <DatasetsModelsPage />;
       case 'events':
         return <EventHistoryPage />;
       case 'settings':
-        return <SettingsPage />;
+        return <SettingsPage onSettingsSaved={fetchStatus} />;
       default:
         return (
           <OverviewPage
             status={systemStatus}
+            isOnline={isBackendOnline}
+            lastUpdated={lastUpdated}
             onNavigate={(tab) => setActiveTab(tab)}
             onRefresh={fetchStatus}
           />
@@ -91,7 +162,7 @@ export const App: React.FC = () => {
       <Navigation
         activeTab={activeTab}
         setActiveTab={setActiveTab}
-        overallState={systemStatus?.overall_state || 'normal'}
+        overallState={isBackendOnline ? (systemStatus?.overall_state || 'normal') : 'unavailable'}
       />
 
       {/* Main Content Area */}
@@ -100,6 +171,7 @@ export const App: React.FC = () => {
         <Header
           status={systemStatus}
           activeProviderName={activeProviderName}
+          isOnline={isBackendOnline}
         />
 
         {/* Scrollable Viewport */}
