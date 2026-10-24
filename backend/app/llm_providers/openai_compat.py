@@ -2,7 +2,7 @@ import httpx
 import time
 import json
 from typing import List, Dict, Any, AsyncGenerator, Optional, Tuple
-from .base import BaseLLMProvider, LLMProviderResponse
+from .base import BaseLLMProvider, LLMProviderResponse, join_url_path
 
 class OpenAICompatProvider(BaseLLMProvider):
     """
@@ -25,11 +25,39 @@ class OpenAICompatProvider(BaseLLMProvider):
     def get_provider_name(self) -> str:
         return self.provider_id
 
+    def _get_models_endpoint(self) -> str:
+        if self.base_url.endswith("/v1") or "/v1" in self.base_url:
+            return join_url_path(self.base_url, "/models")
+        return join_url_path(self.base_url, "/v1/models")
+
+    def _get_chat_endpoint(self) -> str:
+        if self.base_url.endswith("/v1") or "/v1" in self.base_url:
+            return join_url_path(self.base_url, "/chat/completions")
+        return join_url_path(self.base_url, "/v1/chat/completions")
+
     async def check_health(self) -> Tuple[bool, str]:
-        url = f"{self.base_url}/models"
+        endpoint = self._get_models_endpoint()
         try:
             async with httpx.AsyncClient(timeout=3.0) as client:
-                res = await client.get(url)
+                res = await client.get(endpoint)
+                content_type = res.headers.get("content-type", "").lower()
+                body_start = res.text[:200].strip().lower()
+
+                if "text/html" in content_type or body_start.startswith("<!doctype") or body_start.startswith("<html"):
+                    return (
+                        False,
+                        f"Server at {self.base_url} is serving frontend HTML ('text/html'), not an OpenAI-compatible API. "
+                        "It appears to be a web/frontend development server. To connect to an LLM, point to an inference daemon "
+                        "(e.g., LM Studio on port 1234 or llama.cpp on port 8080)."
+                    )
+
+                if res.status_code == 404:
+                    # Try alternative path without /v1 or with /v1
+                    alt_endpoint = join_url_path(self.base_url, "/models")
+                    res2 = await client.get(alt_endpoint)
+                    if res2.status_code == 200:
+                        return True, f"{self.provider_id} server connected and operational."
+
                 if res.status_code == 200:
                     return True, f"{self.provider_id} server connected and operational."
                 return False, f"Server returned HTTP status {res.status_code}."
@@ -39,10 +67,18 @@ class OpenAICompatProvider(BaseLLMProvider):
             return False, f"Connection error: {str(e)}"
 
     async def list_models(self) -> List[str]:
-        url = f"{self.base_url}/models"
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
-                res = await client.get(url)
+                endpoint = self._get_models_endpoint()
+                res = await client.get(endpoint)
+                if res.status_code == 404:
+                    endpoint = join_url_path(self.base_url, "/models")
+                    res = await client.get(endpoint)
+
+                content_type = res.headers.get("content-type", "").lower()
+                if "text/html" in content_type:
+                    return []
+
                 if res.status_code == 200:
                     data = res.json()
                     models = [m.get("id", "unknown") for m in data.get("data", [])]
@@ -57,7 +93,7 @@ class OpenAICompatProvider(BaseLLMProvider):
                        system_prompt: Optional[str] = None,
                        temperature: float = 0.7,
                        max_tokens: int = 512) -> LLMProviderResponse:
-        url = f"{self.base_url}/chat/completions"
+        url = self._get_chat_endpoint()
         messages = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
@@ -75,6 +111,11 @@ class OpenAICompatProvider(BaseLLMProvider):
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
                 res = await client.post(url, json=payload)
+                if res.status_code == 404 and "/v1/" in url:
+                    # Fallback to without /v1
+                    alt_url = join_url_path(self.base_url, "/chat/completions")
+                    res = await client.post(alt_url, json=payload)
+
                 if res.status_code != 200:
                     raise RuntimeError(f"Server error {res.status_code}: {res.text}")
                 data = res.json()
@@ -96,7 +137,7 @@ class OpenAICompatProvider(BaseLLMProvider):
                               system_prompt: Optional[str] = None,
                               temperature: float = 0.7,
                               max_tokens: int = 512) -> AsyncGenerator[str, None]:
-        url = f"{self.base_url}/chat/completions"
+        url = self._get_chat_endpoint()
         messages = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})

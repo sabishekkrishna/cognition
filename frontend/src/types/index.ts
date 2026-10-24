@@ -143,6 +143,7 @@ export interface LLMProviderInfo {
   id: string;
   name: string;
   type: string;
+  base_url?: string;
 }
 
 export interface LLMResponseInfo {

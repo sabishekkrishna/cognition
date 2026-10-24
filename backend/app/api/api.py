@@ -33,7 +33,8 @@ from ..storage.database import (
     get_all_settings, set_setting, get_recent_events, clear_events,
     get_baselines, get_active_baseline, set_active_baseline, delete_baseline
 )
-from ..llm_providers.base import parse_and_validate_local_endpoint
+from ..llm_providers.base import parse_and_validate_local_endpoint, join_url_path
+from ..llm_providers.custom_http import CustomLocalProvider
 from pydantic import BaseModel
 import httpx
 
@@ -57,10 +58,12 @@ class LLMDiagnosticReport(BaseModel):
     saved_as_active: bool = False
 
 class LLMConnectionTestRequest(BaseModel):
-    provider: str = "ollama" # ollama, lm_studio, llama_cpp, mock
+    provider: str = "ollama" # ollama, lm_studio, llama_cpp, custom_http, mock
     base_url: Optional[str] = None
     host: Optional[str] = None
     port: Optional[int] = None
+    api_path: Optional[str] = None
+    adapter_type: Optional[str] = "auto"
     model: Optional[str] = None
     allow_remote: bool = False
     save_if_successful: bool = False
@@ -416,22 +419,28 @@ async def test_llm_connection_diagnostic(req: LLMConnectionTestRequest):
         )
 
     # 1. Determine raw target address
-    if req.host and req.port:
-        raw_addr = f"http://{req.host}:{req.port}"
-    elif req.base_url:
+    if req.base_url:
         raw_addr = req.base_url
+    elif req.host and req.port:
+        raw_addr = f"http://{req.host}:{req.port}"
+    elif req.host:
+        raw_addr = f"http://{req.host}"
     else:
         settings = get_all_settings()
         if req.provider == "ollama":
             raw_addr = settings.get("ollama_url", "http://127.0.0.1:11434")
         elif req.provider == "lm_studio":
             raw_addr = settings.get("openai_compat_url", "http://127.0.0.1:1234/v1")
-        else: # llama_cpp
+        elif req.provider == "llama_cpp":
             raw_addr = settings.get("llama_cpp_url", "http://127.0.0.1:8080/v1")
+        elif req.provider == "custom_http":
+            raw_addr = settings.get("custom_llm_url", "http://127.0.0.1:3000")
+        else:
+            raw_addr = "http://127.0.0.1:11434"
 
     # Step 1: Address and Port Validation
     t0 = time.time()
-    def_port = 11434 if req.provider == "ollama" else 1234 if req.provider == "lm_studio" else 8080
+    def_port = 11434 if req.provider == "ollama" else 1234 if req.provider == "lm_studio" else 8080 if req.provider == "llama_cpp" else 3000
     is_valid, canon_url, host, err_msg, port = parse_and_validate_local_endpoint(
         raw_addr, default_port=def_port, allow_remote=req.allow_remote
     )
@@ -466,9 +475,13 @@ async def test_llm_connection_diagnostic(req: LLMConnectionTestRequest):
 
     # Step 2: Server Reachability Probe
     t0 = time.time()
+    probe_content_type = ""
+    probe_body = ""
     try:
         async with httpx.AsyncClient(timeout=3.0) as client:
             probe_res = await client.get(canon_url)
+            probe_content_type = probe_res.headers.get("content-type", "").lower()
+            probe_body = probe_res.text[:300].strip().lower()
             s2_lat = round((time.time() - t0) * 1000.0, 2)
             steps.append(DiagnosticStepResult(
                 step_number=2,
@@ -542,12 +555,55 @@ async def test_llm_connection_diagnostic(req: LLMConnectionTestRequest):
 
     # Step 3: API Compatibility Check & Step 4: Model Discovery
     t0 = time.time()
+    is_frontend_html = (
+        "text/html" in probe_content_type or
+        probe_body.startswith("<!doctype") or
+        probe_body.startswith("<html")
+    )
+
+    if is_frontend_html:
+        s3_lat = round((time.time() - t0) * 1000.0, 2)
+        steps.append(DiagnosticStepResult(
+            step_number=3,
+            name="API Compatibility",
+            status="fail",
+            latency_ms=s3_lat,
+            message=(
+                f"The server at {canon_url} is serving frontend HTML ('text/html'), not an LLM inference API. "
+                "It appears to be a web/frontend development server. To connect to an LLM, point to an inference daemon "
+                "(e.g., Ollama on port 11434 or LM Studio on port 1234) or configure an LLM proxy."
+            ),
+            remedy=(
+                f"Port {port} is serving the web application UI. A frontend development server cannot directly process LLM inferences. "
+                "Point the address to your inference daemon (e.g. http://localhost:11434 for Ollama or http://localhost:1234 for LM Studio), "
+                "or run an LLM reverse proxy."
+            )
+        ))
+        return LLMDiagnosticReport(
+            provider=req.provider, target_url=canon_url, host=host, port=port,
+            overall_status="failed", steps=steps, discovered_models=[]
+        )
+
     try:
         async with httpx.AsyncClient(timeout=4.0) as client:
             if req.provider == "ollama":
-                tags_url = f"{canon_url}/api/tags"
+                tags_url = join_url_path(canon_url, "/api/tags")
                 res = await client.get(tags_url)
                 s3_lat = round((time.time() - t0) * 1000.0, 2)
+                ct = res.headers.get("content-type", "").lower()
+                if "text/html" in ct or res.text.strip().lower().startswith("<!doctype"):
+                    steps.append(DiagnosticStepResult(
+                        step_number=3,
+                        name="API Compatibility",
+                        status="fail",
+                        latency_ms=s3_lat,
+                        message=f"Endpoint {tags_url} returned HTML ('text/html') instead of JSON. Server is not an Ollama daemon.",
+                        remedy="Confirm this is an Ollama daemon listening on this port."
+                    ))
+                    return LLMDiagnosticReport(
+                        provider=req.provider, target_url=canon_url, host=host, port=port,
+                        overall_status="failed", steps=steps, discovered_models=[]
+                    )
                 if res.status_code == 200:
                     steps.append(DiagnosticStepResult(
                         step_number=3,
@@ -556,8 +612,11 @@ async def test_llm_connection_diagnostic(req: LLMConnectionTestRequest):
                         latency_ms=s3_lat,
                         message=f"Ollama native API endpoint {tags_url} verified."
                     ))
-                    data = res.json()
-                    discovered_models = [m.get("name", "unknown") for m in data.get("models", [])]
+                    try:
+                        data = res.json()
+                        discovered_models = [m.get("name", "unknown") for m in data.get("models", [])]
+                    except Exception:
+                        discovered_models = []
                 else:
                     steps.append(DiagnosticStepResult(
                         step_number=3,
@@ -571,12 +630,33 @@ async def test_llm_connection_diagnostic(req: LLMConnectionTestRequest):
                         provider=req.provider, target_url=canon_url, host=host, port=port,
                         overall_status="failed", steps=steps, discovered_models=[]
                     )
-            else: # OpenAI compatible
-                models_url = f"{canon_url}/models"
+
+            elif req.provider in ["lm_studio", "llama_cpp"]:
+                models_url = join_url_path(canon_url, "/models")
                 if not canon_url.endswith("/v1") and "/v1" not in canon_url:
-                    models_url = f"{canon_url}/v1/models"
+                    models_url = join_url_path(canon_url, "/v1/models")
                 res = await client.get(models_url)
+                if res.status_code == 404:
+                    alt_url = join_url_path(canon_url, "/models")
+                    res = await client.get(alt_url)
+                    if res.status_code == 200:
+                        models_url = alt_url
+
                 s3_lat = round((time.time() - t0) * 1000.0, 2)
+                ct = res.headers.get("content-type", "").lower()
+                if "text/html" in ct or res.text.strip().lower().startswith("<!doctype"):
+                    steps.append(DiagnosticStepResult(
+                        step_number=3,
+                        name="API Compatibility",
+                        status="fail",
+                        latency_ms=s3_lat,
+                        message=f"Endpoint {models_url} returned HTML ('text/html') instead of JSON.",
+                        remedy="Check server path. Many servers require a '/v1' prefix like 'http://127.0.0.1:1234/v1'."
+                    ))
+                    return LLMDiagnosticReport(
+                        provider=req.provider, target_url=canon_url, host=host, port=port,
+                        overall_status="failed", steps=steps, discovered_models=[]
+                    )
                 if res.status_code == 200:
                     steps.append(DiagnosticStepResult(
                         step_number=3,
@@ -585,8 +665,11 @@ async def test_llm_connection_diagnostic(req: LLMConnectionTestRequest):
                         latency_ms=s3_lat,
                         message=f"OpenAI-compatible models endpoint {models_url} verified."
                     ))
-                    data = res.json()
-                    discovered_models = [m.get("id", "unknown") for m in data.get("data", [])]
+                    try:
+                        data = res.json()
+                        discovered_models = [m.get("id", "unknown") for m in data.get("data", [])]
+                    except Exception:
+                        discovered_models = []
                 else:
                     steps.append(DiagnosticStepResult(
                         step_number=3,
@@ -600,6 +683,38 @@ async def test_llm_connection_diagnostic(req: LLMConnectionTestRequest):
                         provider=req.provider, target_url=canon_url, host=host, port=port,
                         overall_status="failed", steps=steps, discovered_models=[]
                     )
+
+            elif req.provider == "custom_http":
+                custom_prov = CustomLocalProvider(
+                    base_url=canon_url,
+                    api_path=req.api_path or "",
+                    adapter_type=req.adapter_type or "auto",
+                    fallback_model=req.model or "custom-model"
+                )
+                is_ok, health_msg = await custom_prov.check_health()
+                s3_lat = round((time.time() - t0) * 1000.0, 2)
+                if not is_ok:
+                    steps.append(DiagnosticStepResult(
+                        step_number=3,
+                        name="API Compatibility",
+                        status="fail",
+                        latency_ms=s3_lat,
+                        message=health_msg,
+                        remedy="Verify custom HTTP server address, base path, and adapter configuration."
+                    ))
+                    return LLMDiagnosticReport(
+                        provider=req.provider, target_url=canon_url, host=host, port=port,
+                        overall_status="failed", steps=steps, discovered_models=[]
+                    )
+                steps.append(DiagnosticStepResult(
+                    step_number=3,
+                    name="API Compatibility",
+                    status="pass",
+                    latency_ms=s3_lat,
+                    message=health_msg
+                ))
+                discovered_models = await custom_prov.list_models()
+
     except Exception as e:
         s3_lat = round((time.time() - t0) * 1000.0, 2)
         steps.append(DiagnosticStepResult(
@@ -617,18 +732,28 @@ async def test_llm_connection_diagnostic(req: LLMConnectionTestRequest):
 
     # Step 4: Model Discovery validation
     if len(discovered_models) == 0:
-        steps.append(DiagnosticStepResult(
-            step_number=4,
-            name="Model Discovery",
-            status="warn",
-            latency_ms=0.5,
-            message="Server connected successfully, but 0 models were discovered.",
-            remedy=(
-                "Pull a local model in terminal: 'ollama pull llama3' or 'ollama pull mistral'."
-                if req.provider == "ollama" else
-                "Load a model into memory in LM Studio or restart llama-server with a model file."
-            )
-        ))
+        if req.model:
+            discovered_models = [req.model]
+            steps.append(DiagnosticStepResult(
+                step_number=4,
+                name="Model Discovery",
+                status="pass",
+                latency_ms=0.5,
+                message=f"Model discovery not exposed by endpoint; utilizing specified model identifier '{req.model}'."
+            ))
+        else:
+            steps.append(DiagnosticStepResult(
+                step_number=4,
+                name="Model Discovery",
+                status="warn",
+                latency_ms=0.5,
+                message="Server connected successfully, but 0 models were discovered.",
+                remedy=(
+                    "Pull a local model in terminal: 'ollama pull llama3' or 'ollama pull mistral'."
+                    if req.provider == "ollama" else
+                    "Load a model into memory in LM Studio, or specify a manual model identifier in settings."
+                )
+            ))
     else:
         steps.append(DiagnosticStepResult(
             step_number=4,
@@ -640,7 +765,7 @@ async def test_llm_connection_diagnostic(req: LLMConnectionTestRequest):
 
     # Step 5: Test Inference
     t0 = time.time()
-    test_model = req.model if (req.model and req.model in discovered_models) else (discovered_models[0] if discovered_models else None)
+    test_model = req.model if (req.model and (req.model in discovered_models or req.provider == "custom_http")) else (discovered_models[0] if discovered_models else None)
 
     if not test_model:
         steps.append(DiagnosticStepResult(
@@ -648,14 +773,35 @@ async def test_llm_connection_diagnostic(req: LLMConnectionTestRequest):
             name="Test Inference",
             status="warn",
             latency_ms=0.0,
-            message="Test inference skipped because no active model is loaded on the provider.",
-            remedy="Install or load a model to test prompt generation."
+            message="Test inference skipped because no active model is loaded or specified.",
+            remedy="Install or load a model, or provide a manual model identifier."
         ))
     else:
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                if req.provider == "ollama":
-                    gen_url = f"{canon_url}/api/generate"
+            if req.provider == "custom_http":
+                custom_prov = CustomLocalProvider(
+                    base_url=canon_url,
+                    api_path=req.api_path or "",
+                    adapter_type=req.adapter_type or "auto",
+                    fallback_model=test_model
+                )
+                res_obj = await custom_prov.generate(
+                    prompt="Say READY",
+                    model=test_model,
+                    max_tokens=8
+                )
+                s5_lat = res_obj.duration_ms
+                sample_response = res_obj.response_text.strip()
+                steps.append(DiagnosticStepResult(
+                    step_number=5,
+                    name="Test Inference",
+                    status="pass",
+                    latency_ms=s5_lat,
+                    message=f"Inference succeeded on '{test_model}' in {s5_lat}ms: '{sample_response}'"
+                ))
+            elif req.provider == "ollama":
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    gen_url = join_url_path(canon_url, "/api/generate")
                     gen_res = await client.post(gen_url, json={
                         "model": test_model,
                         "prompt": "Say READY",
@@ -681,16 +827,25 @@ async def test_llm_connection_diagnostic(req: LLMConnectionTestRequest):
                             message=f"Inference call returned HTTP {gen_res.status_code}: {gen_res.text[:100]}",
                             remedy="Model may need more GPU memory or is still loading."
                         ))
-                else: # OpenAI
-                    chat_url = f"{canon_url}/chat/completions"
+            else: # OpenAI
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    chat_url = join_url_path(canon_url, "/chat/completions")
                     if not canon_url.endswith("/v1") and "/v1" not in canon_url:
-                        chat_url = f"{canon_url}/v1/chat/completions"
+                        chat_url = join_url_path(canon_url, "/v1/chat/completions")
                     gen_res = await client.post(chat_url, json={
                         "model": test_model,
                         "messages": [{"role": "user", "content": "Say READY"}],
                         "max_tokens": 8,
                         "temperature": 0.0
                     })
+                    if gen_res.status_code == 404:
+                        chat_url = join_url_path(canon_url, "/chat/completions")
+                        gen_res = await client.post(chat_url, json={
+                            "model": test_model,
+                            "messages": [{"role": "user", "content": "Say READY"}],
+                            "max_tokens": 8,
+                            "temperature": 0.0
+                        })
                     s5_lat = round((time.time() - t0) * 1000.0, 2)
                     if gen_res.status_code == 200:
                         data = gen_res.json()
@@ -734,11 +889,27 @@ async def test_llm_connection_diagnostic(req: LLMConnectionTestRequest):
             set_setting("openai_compat_url", canon_url)
         elif req.provider == "llama_cpp":
             set_setting("llama_cpp_url", canon_url)
+        elif req.provider == "custom_http":
+            set_setting("custom_llm_url", canon_url)
+            if req.api_path is not None:
+                set_setting("custom_llm_path", req.api_path)
+            if req.adapter_type:
+                set_setting("custom_llm_type", req.adapter_type)
+            if req.model:
+                set_setting("custom_llm_model", req.model)
         set_setting("llm_provider", req.provider)
 
         reg = get_provider_registry()
         reg.update_provider_url(req.provider, canon_url)
+        if req.provider == "custom_http":
+            reg.update_custom_provider_config(
+                base_url=canon_url,
+                api_path=req.api_path,
+                adapter_type=req.adapter_type,
+                fallback_model=req.model
+            )
         reg.set_active_provider(req.provider)
+        reg.sync_from_settings()
         saved_as_active = True
 
     return LLMDiagnosticReport(

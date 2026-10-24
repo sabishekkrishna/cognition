@@ -2,7 +2,7 @@ import httpx
 import time
 import json
 from typing import List, Dict, Any, AsyncGenerator, Optional, Tuple
-from .base import BaseLLMProvider, LLMProviderResponse
+from .base import BaseLLMProvider, LLMProviderResponse, join_url_path
 
 class OllamaProvider(BaseLLMProvider):
     """
@@ -22,10 +22,21 @@ class OllamaProvider(BaseLLMProvider):
         return "ollama"
 
     async def check_health(self) -> Tuple[bool, str]:
-        url = f"{self.base_url}/api/tags"
+        url = join_url_path(self.base_url, "/api/tags")
         try:
             async with httpx.AsyncClient(timeout=3.0) as client:
                 res = await client.get(url)
+                content_type = res.headers.get("content-type", "").lower()
+                body_start = res.text[:200].strip().lower()
+
+                if "text/html" in content_type or body_start.startswith("<!doctype") or body_start.startswith("<html"):
+                    return (
+                        False,
+                        f"Server at {self.base_url} is serving frontend HTML ('text/html'), not an Ollama inference API. "
+                        "It appears to be a web/frontend development server. To connect to an LLM, point to an inference daemon "
+                        "(e.g., Ollama on port 11434) or configure an LLM proxy."
+                    )
+
                 if res.status_code == 200:
                     return True, "Ollama daemon connected and operational."
                 return False, f"Ollama returned HTTP status {res.status_code}."
@@ -35,10 +46,13 @@ class OllamaProvider(BaseLLMProvider):
             return False, f"Ollama connection error: {str(e)}"
 
     async def list_models(self) -> List[str]:
-        url = f"{self.base_url}/api/tags"
+        url = join_url_path(self.base_url, "/api/tags")
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
                 res = await client.get(url)
+                content_type = res.headers.get("content-type", "").lower()
+                if "text/html" in content_type:
+                    return []
                 if res.status_code == 200:
                     data = res.json()
                     models = [m.get("name", "unknown") for m in data.get("models", [])]
@@ -53,7 +67,7 @@ class OllamaProvider(BaseLLMProvider):
                        system_prompt: Optional[str] = None,
                        temperature: float = 0.7,
                        max_tokens: int = 512) -> LLMProviderResponse:
-        url = f"{self.base_url}/api/generate"
+        url = join_url_path(self.base_url, "/api/generate")
         payload = {
             "model": model,
             "prompt": prompt,
@@ -91,7 +105,7 @@ class OllamaProvider(BaseLLMProvider):
                               system_prompt: Optional[str] = None,
                               temperature: float = 0.7,
                               max_tokens: int = 512) -> AsyncGenerator[str, None]:
-        url = f"{self.base_url}/api/generate"
+        url = join_url_path(self.base_url, "/api/generate")
         payload = {
             "model": model,
             "prompt": prompt,

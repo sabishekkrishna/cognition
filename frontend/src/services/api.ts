@@ -175,6 +175,8 @@ export const api = {
     host?: string;
     port?: number;
     base_url?: string;
+    api_path?: string;
+    adapter_type?: string;
     model?: string;
     allow_remote?: boolean;
     save_if_successful?: boolean;

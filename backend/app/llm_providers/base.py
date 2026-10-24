@@ -4,16 +4,64 @@ import urllib.parse
 import ipaddress
 from pydantic import BaseModel
 
+def join_url_path(base_url: str, endpoint: str) -> str:
+    """
+    Safely joins a base URL with an endpoint path without duplicating path segments
+    such as '/v1' or '/api'.
+    Example:
+      join_url_path("http://localhost:3000/v1", "/v1/chat/completions") -> "http://localhost:3000/v1/chat/completions"
+      join_url_path("http://localhost:3000/api", "/api/generate") -> "http://localhost:3000/api/generate"
+      join_url_path("http://localhost:11434", "/api/tags") -> "http://localhost:11434/api/tags"
+    """
+    base = (base_url or "").rstrip("/")
+    ep = (endpoint or "").strip()
+    if not ep:
+        return base
+    if not ep.startswith("/"):
+        ep = "/" + ep
+
+    try:
+        parsed_base = urllib.parse.urlsplit(base)
+        base_path = parsed_base.path.rstrip("/")
+
+        if base_path:
+            # Check if the endpoint starts with base_path to avoid duplication
+            if ep == base_path:
+                ep = ""
+            elif ep.startswith(base_path + "/"):
+                ep = ep[len(base_path):]
+            elif base_path.endswith("/api") and ep.startswith("/api/"):
+                ep = ep[4:]
+            elif base_path.endswith("/v1") and ep.startswith("/v1/"):
+                ep = ep[3:]
+
+        if parsed_base.scheme and parsed_base.netloc:
+            new_path = (base_path + ep) if ep.startswith("/") else (f"{base_path}/{ep}" if ep else base_path)
+            if not new_path.startswith("/"):
+                new_path = "/" + new_path
+            return urllib.parse.urlunsplit((
+                parsed_base.scheme,
+                parsed_base.netloc,
+                new_path,
+                parsed_base.query,
+                parsed_base.fragment
+            ))
+        else:
+            return base + ep
+    except Exception:
+        return base.rstrip("/") + "/" + ep.lstrip("/")
+
 def parse_and_validate_local_endpoint(
     raw_input: str,
-    default_port: int = 11434,
+    default_port: Optional[int] = 11434,
     allow_remote: bool = False
 ) -> Tuple[bool, str, str, str, int]:
     """
     Parses and validates local inference server endpoint with SSRF protection.
     Accepts:
       - 'http://127.0.0.1:11434'
-      - '127.0.0.1:11434'
+      - 'http://localhost:3000'
+      - '127.0.0.1:3000'
       - 'localhost:8080'
       - 'http://localhost:1234/v1'
 
@@ -41,7 +89,12 @@ def parse_and_validate_local_endpoint(
         return False, "", "", "Host name or IP address is required.", 0
 
     try:
-        port = parsed.port or default_port
+        if parsed.port is not None:
+            port = parsed.port
+        elif default_port is not None:
+            port = default_port
+        else:
+            port = 443 if scheme == "https" else 80
     except ValueError:
         return False, "", host, "Invalid port number. Port must be an integer between 1 and 65535.", 0
 
@@ -70,7 +123,7 @@ def parse_and_validate_local_endpoint(
             port
         )
 
-    # Clean canonical URL
+    # Clean canonical URL, preserving port and base path
     path = parsed.path.rstrip("/")
     canonical_url = f"{scheme}://{host}:{port}{path}"
     return True, canonical_url, host, "", port

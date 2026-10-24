@@ -23,12 +23,16 @@ export const LLMConsolePage: React.FC<LLMConsolePageProps> = ({
   const [selectedModel, setSelectedModel] = useState<string>('');
 
   // Diagnostic & Endpoint Configuration
-  const [hostInput, setHostInput] = useState<string>('127.0.0.1');
-  const [portInput, setPortInput] = useState<string>('11434');
+  const [serverUrl, setServerUrl] = useState<string>('http://127.0.0.1:11434');
+  const [apiPath, setApiPath] = useState<string>('');
+  const [adapterType, setAdapterType] = useState<string>('auto');
+  const [manualModel, setManualModel] = useState<string>('custom-model');
+  const [useManualModel, setUseManualModel] = useState<boolean>(false);
   const [allowRemote, setAllowRemote] = useState<boolean>(false);
   const [diagnosticRunning, setDiagnosticRunning] = useState<boolean>(false);
   const [diagnosticReport, setDiagnosticReport] = useState<LLMDiagnosticReport | null>(null);
   const [showDiagnosticPanel, setShowDiagnosticPanel] = useState<boolean>(false);
+  const [saveSuccessMsg, setSaveSuccessMsg] = useState<string | null>(null);
 
   // Generation state
   const [prompt, setPrompt] = useState<string>('Analyze the reliability of the current visual component input.');
@@ -50,18 +54,24 @@ export const LLMConsolePage: React.FC<LLMConsolePageProps> = ({
       setProviders(res.providers || []);
       const active = res.active_provider || 'mock';
       setSelectedProvider(active);
-      updateDefaultPortForProvider(active);
+      const activeProvObj = res.providers?.find((p: any) => p.id === active);
+      if (activeProvObj?.base_url && activeProvObj.base_url !== 'internal://mock') {
+        setServerUrl(activeProvObj.base_url);
+      } else {
+        updateDefaultUrlForProvider(active);
+      }
       await checkHealthAndModels(active);
     } catch (err) {
       console.error(err);
     }
   };
 
-  const updateDefaultPortForProvider = (provId: string) => {
-    if (provId === 'ollama') setPortInput('11434');
-    else if (provId === 'lm_studio') setPortInput('1234');
-    else if (provId === 'llama_cpp') setPortInput('8080');
-    else setPortInput('0');
+  const updateDefaultUrlForProvider = (provId: string) => {
+    if (provId === 'ollama') setServerUrl('http://127.0.0.1:11434');
+    else if (provId === 'lm_studio') setServerUrl('http://127.0.0.1:1234/v1');
+    else if (provId === 'llama_cpp') setServerUrl('http://127.0.0.1:8080/v1');
+    else if (provId === 'custom_http') setServerUrl('http://localhost:3000');
+    else setServerUrl('internal://mock');
   };
 
   const checkHealthAndModels = async (provId: string) => {
@@ -76,10 +86,10 @@ export const LLMConsolePage: React.FC<LLMConsolePageProps> = ({
         setModels(mList);
         if (mList.length > 0) {
           setSelectedModel(mList[0]);
+          setManualModel(mList[0]);
         }
       } else {
         setModels([]);
-        setSelectedModel('');
       }
     } catch (err: any) {
       setProviderConnected(false);
@@ -89,8 +99,14 @@ export const LLMConsolePage: React.FC<LLMConsolePageProps> = ({
 
   const handleProviderChange = async (newProv: string) => {
     setSelectedProvider(newProv);
-    updateDefaultPortForProvider(newProv);
+    const found = providers.find((p) => p.id === newProv);
+    if (found?.base_url && found.base_url !== 'internal://mock') {
+      setServerUrl(found.base_url);
+    } else {
+      updateDefaultUrlForProvider(newProv);
+    }
     setDiagnosticReport(null);
+    setSaveSuccessMsg(null);
     await checkHealthAndModels(newProv);
   };
 
@@ -98,10 +114,15 @@ export const LLMConsolePage: React.FC<LLMConsolePageProps> = ({
     try {
       setDiagnosticRunning(true);
       setShowDiagnosticPanel(true);
+      setSaveSuccessMsg(null);
+
+      const effectiveModel = useManualModel ? manualModel : (selectedModel || manualModel);
       const report = await api.testLLMConnection({
         provider: selectedProvider,
-        host: hostInput,
-        port: parseInt(portInput, 10) || (selectedProvider === 'ollama' ? 11434 : 1234),
+        base_url: selectedProvider === 'mock' ? undefined : serverUrl,
+        api_path: apiPath,
+        adapter_type: adapterType,
+        model: effectiveModel,
         allow_remote: allowRemote,
         save_if_successful: saveAsActive
       });
@@ -111,10 +132,11 @@ export const LLMConsolePage: React.FC<LLMConsolePageProps> = ({
         setProviderConnected(true);
         setProviderMessage(`Diagnostic passed. Discovered ${report.discovered_models.length} model(s).`);
         setModels(report.discovered_models);
-        if (report.discovered_models.length > 0) {
+        if (report.discovered_models.length > 0 && !useManualModel) {
           setSelectedModel(report.discovered_models[0]);
         }
         if (saveAsActive) {
+          setSaveSuccessMsg('Configuration successfully validated, saved, and activated!');
           await loadProviders();
         }
       } else {
@@ -130,7 +152,8 @@ export const LLMConsolePage: React.FC<LLMConsolePageProps> = ({
   };
 
   const handleSendPrompt = async () => {
-    if (!prompt.trim() || !selectedModel) return;
+    const effectiveModel = useManualModel ? manualModel : (selectedModel || manualModel);
+    if (!prompt.trim() || !effectiveModel) return;
     setLoading(true);
     setFeedbackSubmitted(null);
     setCurrentResponse(null);
@@ -138,7 +161,7 @@ export const LLMConsolePage: React.FC<LLMConsolePageProps> = ({
     try {
       const res = await api.generateLLM({
         provider: selectedProvider,
-        model: selectedModel,
+        model: effectiveModel,
         prompt: prompt,
         system_prompt: systemPrompt,
         current_input_risk_score: currentInputRiskScore,
@@ -214,32 +237,88 @@ export const LLMConsolePage: React.FC<LLMConsolePageProps> = ({
               </select>
             </div>
 
-            {/* Custom Host & Port Configuration */}
+            {/* Full Editable Server URL, Optional Base Path & Adapter Settings */}
             {selectedProvider !== 'mock' && (
-              <div className="space-y-2 p-3 rounded-xl bg-slate-900/60 border border-slate-800">
-                <div className="grid grid-cols-3 gap-2">
-                  <div className="col-span-2">
-                    <label className="text-[10px] font-mono text-slate-400 block mb-1">Target Host:</label>
-                    <input
-                      type="text"
-                      value={hostInput}
-                      onChange={(e) => setHostInput(e.target.value)}
-                      placeholder="127.0.0.1"
-                      className="w-full bg-[#0d1322] border border-[#1f293d] rounded-lg px-2.5 py-1.5 text-xs text-white font-mono focus:outline-none focus:border-blue-500"
-                    />
+              <div className="space-y-3 p-3.5 rounded-xl bg-slate-900/60 border border-slate-800">
+                <div>
+                  <div className="flex items-center justify-between mb-1">
+                    <label className="text-[10px] font-mono text-slate-400">Server Endpoint URL:</label>
+                    <span className="text-[9px] text-slate-500 font-mono">Custom port supported</span>
                   </div>
-                  <div>
-                    <label className="text-[10px] font-mono text-slate-400 block mb-1">Port:</label>
-                    <input
-                      type="text"
-                      value={portInput}
-                      onChange={(e) => setPortInput(e.target.value)}
-                      placeholder="11434"
-                      className="w-full bg-[#0d1322] border border-[#1f293d] rounded-lg px-2.5 py-1.5 text-xs text-white font-mono focus:outline-none focus:border-blue-500"
-                    />
+                  <input
+                    type="text"
+                    value={serverUrl}
+                    onChange={(e) => setServerUrl(e.target.value)}
+                    placeholder="http://localhost:3000"
+                    className="w-full bg-[#0d1322] border border-[#1f293d] rounded-lg px-2.5 py-1.5 text-xs text-white font-mono focus:outline-none focus:border-blue-500"
+                  />
+                  {/* Quick Preset Buttons */}
+                  <div className="flex flex-wrap gap-1 mt-1.5">
+                    <button
+                      type="button"
+                      onClick={() => setServerUrl('http://localhost:3000')}
+                      className="px-2 py-0.5 rounded text-[9px] bg-slate-800 hover:bg-slate-700 text-slate-300 font-mono border border-slate-700"
+                    >
+                      localhost:3000
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setServerUrl('http://127.0.0.1:3000')}
+                      className="px-2 py-0.5 rounded text-[9px] bg-slate-800 hover:bg-slate-700 text-slate-300 font-mono border border-slate-700"
+                    >
+                      127.0.0.1:3000
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setServerUrl('http://127.0.0.1:11434')}
+                      className="px-2 py-0.5 rounded text-[9px] bg-slate-800 hover:bg-slate-700 text-slate-300 font-mono border border-slate-700"
+                    >
+                      127.0.0.1:11434 (Ollama)
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setServerUrl('http://127.0.0.1:1234/v1')}
+                      className="px-2 py-0.5 rounded text-[9px] bg-slate-800 hover:bg-slate-700 text-slate-300 font-mono border border-slate-700"
+                    >
+                      127.0.0.1:1234 (LM Studio)
+                    </button>
                   </div>
                 </div>
 
+                {/* Optional API Base Path */}
+                <div>
+                  <label className="text-[10px] font-mono text-slate-400 block mb-1">
+                    API Base Path (Optional):
+                  </label>
+                  <input
+                    type="text"
+                    value={apiPath}
+                    onChange={(e) => setApiPath(e.target.value)}
+                    placeholder="e.g. /v1, /api, or empty for root"
+                    className="w-full bg-[#0d1322] border border-[#1f293d] rounded-lg px-2.5 py-1.5 text-xs text-white font-mono focus:outline-none focus:border-blue-500"
+                  />
+                </div>
+
+                {/* Custom Provider Adapter Mode */}
+                {selectedProvider === 'custom_http' && (
+                  <div>
+                    <label className="text-[10px] font-mono text-slate-400 block mb-1">
+                      Custom Adapter Protocol:
+                    </label>
+                    <select
+                      value={adapterType}
+                      onChange={(e) => setAdapterType(e.target.value)}
+                      className="w-full bg-[#0d1322] border border-[#1f293d] rounded-lg px-2.5 py-1.5 text-xs text-white font-mono focus:outline-none focus:border-blue-500"
+                    >
+                      <option value="auto">Auto-Detect Protocol (Recommended)</option>
+                      <option value="openai">OpenAI-Compatible (/chat/completions)</option>
+                      <option value="ollama">Ollama-Compatible (/api/generate)</option>
+                      <option value="generic">Generic JSON POST (/generate)</option>
+                    </select>
+                  </div>
+                )}
+
+                {/* SSRF check */}
                 <div className="flex items-center gap-2 pt-1">
                   <input
                     type="checkbox"
@@ -253,6 +332,7 @@ export const LLMConsolePage: React.FC<LLMConsolePageProps> = ({
                   </label>
                 </div>
 
+                {/* Action Buttons */}
                 <div className="flex items-center gap-2 pt-1.5">
                   <button
                     onClick={() => runDiagnosticTest(false)}
@@ -265,12 +345,19 @@ export const LLMConsolePage: React.FC<LLMConsolePageProps> = ({
                   <button
                     onClick={() => runDiagnosticTest(true)}
                     disabled={diagnosticRunning}
-                    className="py-1.5 px-2.5 rounded-lg bg-emerald-600/30 hover:bg-emerald-600/40 border border-emerald-500/40 text-[11px] text-emerald-200 font-medium transition"
-                    title="Validate and save as active provider"
+                    className="py-1.5 px-3 rounded-lg bg-emerald-600/30 hover:bg-emerald-600/40 border border-emerald-500/40 text-[11px] text-emerald-200 font-medium transition"
+                    title="Validate URL and save as active provider"
                   >
                     Save & Activate
                   </button>
                 </div>
+
+                {saveSuccessMsg && (
+                  <div className="p-2 rounded bg-emerald-950/40 border border-emerald-500/40 text-[11px] text-emerald-300 flex items-center gap-1.5 font-medium">
+                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                    <span>{saveSuccessMsg}</span>
+                  </div>
+                )}
               </div>
             )}
 
@@ -308,8 +395,8 @@ export const LLMConsolePage: React.FC<LLMConsolePageProps> = ({
                       </div>
                       <p className="text-slate-400 pl-5 text-[10px] font-sans">{st.message}</p>
                       {st.remedy && (
-                        <p className="text-amber-300/90 pl-5 text-[10px] font-sans bg-amber-950/20 p-1 rounded mt-1">
-                          Remedy: {st.remedy}
+                        <p className="text-amber-300/90 pl-5 text-[10px] font-sans bg-amber-950/20 p-1.5 rounded mt-1 border border-amber-900/30">
+                          <strong>Remedy / Guidance:</strong> {st.remedy}
                         </p>
                       )}
                     </div>
@@ -341,19 +428,28 @@ export const LLMConsolePage: React.FC<LLMConsolePageProps> = ({
               </div>
             </div>
 
-            {/* Model Selector */}
-            <div>
+            {/* Model Selector & Manual Model Identifier */}
+            <div className="space-y-2">
               <div className="flex items-center justify-between mb-1">
-                <label className="text-[11px] font-mono text-slate-400">Available Model:</label>
-                <button
-                  onClick={() => checkHealthAndModels(selectedProvider)}
-                  className="text-[10px] text-blue-400 hover:text-blue-300 font-mono flex items-center gap-1"
-                >
-                  <RefreshCw className="w-3 h-3" /> Refresh
-                </button>
+                <label className="text-[11px] font-mono text-slate-400">Model Selection:</label>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setUseManualModel(!useManualModel)}
+                    className="text-[10px] text-emerald-400 hover:text-emerald-300 font-mono"
+                  >
+                    {useManualModel ? 'Switch to Discovered' : 'Enter Manually'}
+                  </button>
+                  <button
+                    onClick={() => checkHealthAndModels(selectedProvider)}
+                    className="text-[10px] text-blue-400 hover:text-blue-300 font-mono flex items-center gap-1"
+                  >
+                    <RefreshCw className="w-3 h-3" /> Refresh
+                  </button>
+                </div>
               </div>
 
-              {models.length > 0 ? (
+              {!useManualModel && models.length > 0 ? (
                 <select
                   value={selectedModel}
                   onChange={(e) => setSelectedModel(e.target.value)}
@@ -366,8 +462,19 @@ export const LLMConsolePage: React.FC<LLMConsolePageProps> = ({
                   ))}
                 </select>
               ) : (
-                <div className="p-2.5 rounded-lg bg-slate-900/60 border border-slate-800 text-xs text-slate-500 font-mono">
-                  No local models discovered. Verify server is running locally.
+                <div className="space-y-1">
+                  <input
+                    type="text"
+                    value={manualModel}
+                    onChange={(e) => setManualModel(e.target.value)}
+                    placeholder="e.g. llama3, mistral, custom-model"
+                    className="w-full bg-[#0d1322] border border-[#1f293d] rounded-xl px-3 py-2 text-xs text-white font-mono focus:outline-none focus:border-blue-500"
+                  />
+                  <p className="text-[10px] text-slate-400">
+                    {models.length === 0
+                      ? 'No models discovered via discovery endpoints. Enter model name manually for inference.'
+                      : 'Manual model override active.'}
+                  </p>
                 </div>
               )}
             </div>

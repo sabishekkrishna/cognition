@@ -142,6 +142,37 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ onSettingsSaved }) =
                 className="w-full bg-[#0d1322] border border-[#1f293d] rounded-xl px-3 py-2 text-white font-mono focus:outline-none focus:border-blue-500"
               />
             </div>
+
+            <div>
+              <div className="flex justify-between items-center mb-1">
+                <label className="text-[11px] font-mono text-slate-400">Custom Local HTTP API URL:</label>
+                <button
+                  type="button"
+                  onClick={() => testEndpoint('custom_http', settings.custom_llm_url || 'http://localhost:3000')}
+                  className="text-[10px] text-blue-400 hover:text-blue-300 font-mono"
+                >
+                  Test Reachability
+                </button>
+              </div>
+              <input
+                type="text"
+                value={settings.custom_llm_url || 'http://localhost:3000'}
+                onChange={(e) => handleChange('custom_llm_url', e.target.value)}
+                placeholder="http://localhost:3000"
+                className="w-full bg-[#0d1322] border border-[#1f293d] rounded-xl px-3 py-2 text-white font-mono focus:outline-none focus:border-blue-500"
+              />
+            </div>
+
+            <div>
+              <label className="text-[11px] font-mono text-slate-400 block mb-1">Custom API Base Path:</label>
+              <input
+                type="text"
+                value={settings.custom_llm_path || ''}
+                onChange={(e) => handleChange('custom_llm_path', e.target.value)}
+                placeholder="e.g. /v1, /api, or empty"
+                className="w-full bg-[#0d1322] border border-[#1f293d] rounded-xl px-3 py-2 text-white font-mono focus:outline-none focus:border-blue-500"
+              />
+            </div>
           </div>
 
           {/* SSRF Protection Policy */}
