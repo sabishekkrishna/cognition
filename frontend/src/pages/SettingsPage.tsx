@@ -148,7 +148,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ onSettingsSaved }) =
                 <label className="text-[11px] font-mono text-slate-400">Custom Local HTTP API URL:</label>
                 <button
                   type="button"
-                  onClick={() => testEndpoint('custom_http', settings.custom_llm_url || 'http://localhost:3000')}
+                  onClick={() => testEndpoint('custom_http', settings.custom_llm_url || 'http://localhost:8080')}
                   className="text-[10px] text-blue-400 hover:text-blue-300 font-mono"
                 >
                   Test Reachability
@@ -156,9 +156,9 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ onSettingsSaved }) =
               </div>
               <input
                 type="text"
-                value={settings.custom_llm_url || 'http://localhost:3000'}
+                value={settings.custom_llm_url || 'http://localhost:8080'}
                 onChange={(e) => handleChange('custom_llm_url', e.target.value)}
-                placeholder="http://localhost:3000"
+                placeholder="http://localhost:8080"
                 className="w-full bg-[#0d1322] border border-[#1f293d] rounded-xl px-3 py-2 text-white font-mono focus:outline-none focus:border-blue-500"
               />
             </div>

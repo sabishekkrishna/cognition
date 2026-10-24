@@ -109,7 +109,7 @@ def init_db():
         "ollama_url": "http://127.0.0.1:11434",
         "openai_compat_url": "http://127.0.0.1:1234/v1",
         "llama_cpp_url": "http://127.0.0.1:8080/v1",
-        "custom_llm_url": "http://127.0.0.1:3000",
+        "custom_llm_url": os.getenv("LLM_BASE_URL", "http://127.0.0.1:8080"),
         "custom_llm_path": "",
         "custom_llm_type": "auto",
         "custom_llm_model": "custom-model",
@@ -126,6 +126,11 @@ def init_db():
 
     # Fix legacy typo in ollama_url if present
     cursor.execute("UPDATE settings SET value = 'http://127.0.0.1:11434' WHERE key = 'ollama_url' AND value = 'http://127.0.0.1:1434'")
+
+    # Synchronize custom_llm_url with LLM_BASE_URL if explicitly provided in environment
+    env_llm_base = os.getenv("LLM_BASE_URL")
+    if env_llm_base:
+        cursor.execute("UPDATE settings SET value = ?, updated_at = ? WHERE key = 'custom_llm_url'", (env_llm_base, time.time()))
 
     for k, v in default_settings.items():
         cursor.execute("SELECT key FROM settings WHERE key = ?", (k,))

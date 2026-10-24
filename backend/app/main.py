@@ -7,7 +7,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from .api.api import api_router, decode_image_bytes
+from .api.api import api_router, decode_image_bytes, proxy_chat_endpoint, proxy_models_endpoint
 from .image.metrics import analyze_image_quality
 from .image.classifier import get_classifier
 from .audio.metrics import analyze_audio_quality, parse_audio_data
@@ -32,6 +32,10 @@ app.add_middleware(
 
 # Include REST API routes
 app.include_router(api_router, prefix="/api")
+
+# Direct root endpoints for transparent client proxying (Client -> Port 8000 -> LLM 8080)
+app.add_api_route("/chat", proxy_chat_endpoint, methods=["POST"])
+app.add_api_route("/models", proxy_models_endpoint, methods=["GET"])
 
 # Initialize database
 @app.on_event("startup")

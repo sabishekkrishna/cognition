@@ -1,4 +1,4 @@
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Query, Body
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Query, Body, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 import cv2
 import numpy as np
@@ -6,6 +6,7 @@ import base64
 import json
 import io
 import time
+import os
 from typing import Optional, List, Dict, Any
 
 from ..schemas.schemas import (
@@ -37,6 +38,30 @@ from ..llm_providers.base import parse_and_validate_local_endpoint, join_url_pat
 from ..llm_providers.custom_http import CustomLocalProvider
 from pydantic import BaseModel
 import httpx
+from urllib.parse import urlparse
+
+MONITOR_PORT = int(os.getenv("MONITOR_PORT", os.getenv("PORT", "8000")))
+
+def get_configured_llm_base_url() -> str:
+    env_url = os.getenv("LLM_BASE_URL")
+    if env_url:
+        return env_url.rstrip("/")
+    settings = get_all_settings()
+    custom_url = settings.get("custom_llm_url")
+    if custom_url and "3000" not in custom_url:
+        return custom_url.rstrip("/")
+    return "http://localhost:8080"
+
+def check_proxy_loop(target_url: str, current_port: int) -> bool:
+    try:
+        parsed = urlparse(target_url)
+        target_port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        target_host = (parsed.hostname or "").lower()
+        if target_host in ["localhost", "127.0.0.1", "0.0.0.0", "::1"] and target_port == current_port:
+            return True
+    except Exception:
+        pass
+    return False
 
 class DiagnosticStepResult(BaseModel):
     step_number: int
@@ -478,7 +503,7 @@ async def test_llm_connection_diagnostic(req: LLMConnectionTestRequest):
     probe_content_type = ""
     probe_body = ""
     try:
-        async with httpx.AsyncClient(timeout=3.0) as client:
+        async with httpx.AsyncClient(timeout=6.0) as client:
             probe_res = await client.get(canon_url)
             probe_content_type = probe_res.headers.get("content-type", "").lower()
             probe_body = probe_res.text[:300].strip().lower()
@@ -561,7 +586,7 @@ async def test_llm_connection_diagnostic(req: LLMConnectionTestRequest):
         probe_body.startswith("<html")
     )
 
-    if is_frontend_html:
+    if is_frontend_html and req.provider != "custom_http":
         s3_lat = round((time.time() - t0) * 1000.0, 2)
         steps.append(DiagnosticStepResult(
             step_number=3,
@@ -585,7 +610,7 @@ async def test_llm_connection_diagnostic(req: LLMConnectionTestRequest):
         )
 
     try:
-        async with httpx.AsyncClient(timeout=4.0) as client:
+        async with httpx.AsyncClient(timeout=10.0) as client:
             if req.provider == "ollama":
                 tags_url = join_url_path(canon_url, "/api/tags")
                 res = await client.get(tags_url)
@@ -924,6 +949,255 @@ async def test_llm_connection_diagnostic(req: LLMConnectionTestRequest):
         saved_as_active=saved_as_active
     )
 
+# ==================== TRANSPARENT LLM PROXY & MONITORING ====================
+
+@api_router.post("/chat")
+@api_router.post("/llm/proxy/chat")
+async def proxy_chat_endpoint(request: Request):
+    """
+    Transparent proxy endpoint connecting client requests to the custom LLM server on port 8080 (or LLM_BASE_URL).
+    Preserves original request body, model selection, messages, parameters, and headers.
+    Captures input prompt and generated response, running them through the Reliability Monitor evaluation pipeline.
+    Returns original upstream LLM response to client with monitoring telemetry attached in custom response headers.
+    """
+    upstream_base = get_configured_llm_base_url()
+
+    # Loop prevention: Ensure LLM_BASE_URL does not point back to AI Monitor port
+    if check_proxy_loop(upstream_base, MONITOR_PORT):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Infinite proxy loop detected: LLM_BASE_URL ({upstream_base}) points to the AI Monitor port ({MONITOR_PORT}). Set LLM_BASE_URL to the custom LLM server (e.g. http://localhost:8080)."
+        )
+
+    # Read body bytes and parse JSON
+    req_bytes = await request.body()
+    try:
+        body = json.loads(req_bytes) if req_bytes else {}
+    except Exception:
+        body = {}
+
+    # Extract prompt from messages list or top-level prompt parameter
+    messages = body.get("messages", [])
+    prompt = ""
+    if isinstance(messages, list) and len(messages) > 0:
+        for m in reversed(messages):
+            if isinstance(m, dict) and m.get("role") == "user":
+                prompt = m.get("content", "")
+                break
+    if not prompt and "prompt" in body:
+        prompt = str(body["prompt"])
+
+    model = body.get("model", "")
+    is_stream = bool(body.get("stream", False))
+
+    # Extract input quality risk score and subsystem if provided
+    try:
+        input_risk_score = float(request.headers.get("x-input-risk-score") or body.get("input_risk_score") or 0.0)
+    except (ValueError, TypeError):
+        input_risk_score = 0.0
+    input_subsystem = request.headers.get("x-input-subsystem") or body.get("input_subsystem")
+
+    # Resolve upstream endpoint
+    if upstream_base.endswith("/api/chat"):
+        upstream_url = upstream_base
+    elif upstream_base.endswith("/api"):
+        upstream_url = f"{upstream_base}/chat"
+    else:
+        upstream_url = join_url_path(upstream_base, "/api/chat")
+
+    # Filter headers to forward
+    headers_to_forward = {}
+    for k, v in request.headers.items():
+        if k.lower() not in ["host", "content-length"]:
+            headers_to_forward[k] = v
+    headers_to_forward["content-type"] = "application/json"
+
+    if not is_stream:
+        t0 = time.time()
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                upstream_resp = await client.post(
+                    upstream_url,
+                    content=req_bytes,
+                    headers=headers_to_forward
+                )
+        except httpx.ConnectError:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Bad Gateway: Unable to connect to upstream LLM server at {upstream_base}. Ensure custom LLM is running on port 8080."
+            )
+        except httpx.TimeoutException:
+            raise HTTPException(
+                status_code=504,
+                detail=f"Gateway Timeout: Upstream LLM server at {upstream_base} timed out after 120s."
+            )
+        except Exception as e:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Upstream communication failure: {str(e)}"
+            )
+
+        latency_ms = round((time.time() - t0) * 1000.0, 2)
+
+        # Forward non-200 responses directly without evaluation
+        if upstream_resp.status_code != 200:
+            return Response(
+                content=upstream_resp.content,
+                status_code=upstream_resp.status_code,
+                headers={k: v for k, v in upstream_resp.headers.items() if k.lower() not in ["content-length", "content-encoding", "transfer-encoding"]}
+            )
+
+        try:
+            resp_json = upstream_resp.json()
+        except Exception:
+            resp_json = {"response": upstream_resp.text, "model": model}
+
+        if isinstance(resp_json, dict):
+            response_text = resp_json.get("response") or resp_json.get("content") or ""
+            resolved_model = resp_json.get("model") or model or "custom-model"
+        else:
+            response_text = str(resp_json)
+            resolved_model = model or "custom-model"
+
+        # Evaluate captured exchange using real-world evidence and relevance
+        eval_res = ResponseMonitor.evaluate_response_detailed(
+            prompt=prompt,
+            response_text=response_text,
+            input_risk_score=input_risk_score,
+            input_subsystem=input_subsystem
+        )
+
+        interaction_id = ResponseMonitor.record_interaction(
+            provider="custom_http",
+            model=resolved_model,
+            prompt=prompt,
+            response=response_text,
+            input_subsystem=input_subsystem,
+            input_risk_score=input_risk_score,
+            response_risk_score=eval_res["response_risk_score"],
+            warnings=eval_res["warnings"],
+            latency_ms=latency_ms,
+            relevance_score=eval_res["relevance_score"],
+            evidence_status=eval_res["evidence_status"],
+            metadata={"evaluation": eval_res}
+        )
+
+        monitor_headers = {
+            "X-Monitor-Risk-Score": str(eval_res["response_risk_score"]),
+            "X-Monitor-Interaction-Id": str(interaction_id),
+            "X-Monitor-Relevance-Score": str(eval_res["relevance_score"]),
+            "X-Monitor-Evidence-Status": str(eval_res["evidence_status"]),
+            "X-Monitor-Status": str(eval_res["status"]),
+            "X-Monitor-Latency-Ms": str(latency_ms)
+        }
+
+        return JSONResponse(
+            content=resp_json,
+            headers=monitor_headers
+        )
+
+    else:
+        # Streamed response handling: stream tokens in real-time, buffer for post-generation evaluation
+        async def proxy_stream_generator():
+            chunks_collected = []
+            t0 = time.time()
+            client = httpx.AsyncClient(timeout=180.0)
+            try:
+                async with client:
+                    async with client.stream(
+                        "POST",
+                        upstream_url,
+                        content=req_bytes,
+                        headers=headers_to_forward
+                    ) as upstream_stream:
+                        if upstream_stream.status_code != 200:
+                            err_content = await upstream_stream.aread()
+                            yield err_content
+                            return
+
+                        async for chunk in upstream_stream.aiter_text():
+                            if chunk:
+                                chunks_collected.append(chunk)
+                                yield chunk
+            except httpx.ConnectError:
+                yield f"Error: Bad Gateway - Unable to connect to upstream LLM at {upstream_base}."
+                return
+            except httpx.TimeoutException:
+                yield f"Error: Gateway Timeout - Upstream stream at {upstream_base} timed out."
+                return
+            except Exception as e:
+                yield f"Error: Upstream streaming error: {str(e)}"
+                return
+            finally:
+                full_text = "".join(chunks_collected)
+                if full_text.strip():
+                    latency_ms = round((time.time() - t0) * 1000.0, 2)
+                    try:
+                        eval_res = ResponseMonitor.evaluate_response_detailed(
+                            prompt=prompt,
+                            response_text=full_text,
+                            input_risk_score=input_risk_score,
+                            input_subsystem=input_subsystem
+                        )
+                        ResponseMonitor.record_interaction(
+                            provider="custom_http",
+                            model=model or "custom-stream",
+                            prompt=prompt,
+                            response=full_text,
+                            input_subsystem=input_subsystem,
+                            input_risk_score=input_risk_score,
+                            response_risk_score=eval_res["response_risk_score"],
+                            warnings=eval_res["warnings"],
+                            latency_ms=latency_ms,
+                            relevance_score=eval_res["relevance_score"],
+                            evidence_status=eval_res["evidence_status"],
+                            metadata={"evaluation": eval_res}
+                        )
+                    except Exception:
+                        pass
+
+        return StreamingResponse(
+            proxy_stream_generator(),
+            media_type="text/plain"
+        )
+
+@api_router.get("/models")
+async def proxy_models_endpoint():
+    """Proxies model discovery to upstream custom LLM server on port 8080."""
+    upstream_base = get_configured_llm_base_url()
+    if check_proxy_loop(upstream_base, MONITOR_PORT):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Infinite proxy loop detected: LLM_BASE_URL points to monitor port {MONITOR_PORT}."
+        )
+
+    upstream_url = join_url_path(upstream_base, "/api/models")
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(upstream_url)
+            if resp.status_code == 200:
+                return resp.json()
+            alt_url = join_url_path(upstream_base, "/models")
+            alt_resp = await client.get(alt_url)
+            if alt_resp.status_code == 200:
+                return alt_resp.json()
+            return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
+    except httpx.ConnectError:
+        registry = get_provider_registry()
+        models = await registry.get_provider().list_models()
+        return {"models": [{"name": m, "model": m} for m in models], "fallback": True}
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to query upstream models: {str(e)}")
+
+@api_router.get("/llm/interactions")
+async def list_llm_interactions(limit: int = 50):
+    """Returns recent captured LLM interactions with their evaluation metrics."""
+    records = ResponseMonitor.list_interactions(limit=limit)
+    return {
+        "interactions": records,
+        "count": len(records)
+    }
+
 @api_router.post("/llm/generate", response_model=LLMResponseInfo)
 async def generate_llm_response(req: LLMGenerateRequest):
     registry = get_provider_registry()
@@ -941,7 +1215,7 @@ async def generate_llm_response(req: LLMGenerateRequest):
         raise HTTPException(status_code=503, detail=f"LLM Generation Error: {str(e)}")
 
     # Response reliability monitoring
-    resp_risk, warnings, is_uncert, is_empty = ResponseMonitor.evaluate_response(
+    eval_res = ResponseMonitor.evaluate_response_detailed(
         prompt=req.prompt,
         response_text=provider_resp.response_text,
         input_risk_score=req.current_input_risk_score or 0.0,
@@ -955,8 +1229,12 @@ async def generate_llm_response(req: LLMGenerateRequest):
         response=provider_resp.response_text,
         input_subsystem=req.current_input_subsystem,
         input_risk_score=req.current_input_risk_score or 0.0,
-        response_risk_score=resp_risk,
-        warnings=warnings
+        response_risk_score=eval_res["response_risk_score"],
+        warnings=eval_res["warnings"],
+        latency_ms=provider_resp.duration_ms,
+        relevance_score=eval_res["relevance_score"],
+        evidence_status=eval_res["evidence_status"],
+        metadata={"evaluation": eval_res}
     )
 
     return LLMResponseInfo(
@@ -966,10 +1244,10 @@ async def generate_llm_response(req: LLMGenerateRequest):
         response=provider_resp.response_text,
         duration_ms=provider_resp.duration_ms,
         input_risk_score=req.current_input_risk_score or 0.0,
-        response_risk_score=resp_risk,
-        warnings=warnings,
-        is_uncertain=is_uncert,
-        is_empty=is_empty,
+        response_risk_score=eval_res["response_risk_score"],
+        warnings=eval_res["warnings"],
+        is_uncertain=eval_res["is_uncertain"],
+        is_empty=eval_res["is_empty"],
         interaction_id=interaction_id
     )
 
@@ -979,14 +1257,45 @@ async def generate_llm_stream(req: LLMGenerateRequest):
     prov = registry.get_provider(req.provider)
 
     async def token_generator():
-        async for chunk in prov.generate_stream(
-            prompt=req.prompt,
-            model=req.model,
-            system_prompt=req.system_prompt,
-            temperature=req.temperature,
-            max_tokens=req.max_tokens
-        ):
-            yield f"data: {json.dumps({'chunk': chunk})}\n\n"
+        collected = []
+        t0 = time.time()
+        try:
+            async for chunk in prov.generate_stream(
+                prompt=req.prompt,
+                model=req.model,
+                system_prompt=req.system_prompt,
+                temperature=req.temperature,
+                max_tokens=req.max_tokens
+            ):
+                collected.append(chunk)
+                yield f"data: {json.dumps({'chunk': chunk})}\n\n"
+        finally:
+            full_text = "".join(collected)
+            if full_text.strip():
+                latency_ms = round((time.time() - t0) * 1000.0, 2)
+                try:
+                    eval_res = ResponseMonitor.evaluate_response_detailed(
+                        prompt=req.prompt,
+                        response_text=full_text,
+                        input_risk_score=req.current_input_risk_score or 0.0,
+                        input_subsystem=req.current_input_subsystem
+                    )
+                    ResponseMonitor.record_interaction(
+                        provider=req.provider,
+                        model=req.model,
+                        prompt=req.prompt,
+                        response=full_text,
+                        input_subsystem=req.current_input_subsystem,
+                        input_risk_score=req.current_input_risk_score or 0.0,
+                        response_risk_score=eval_res["response_risk_score"],
+                        warnings=eval_res["warnings"],
+                        latency_ms=latency_ms,
+                        relevance_score=eval_res["relevance_score"],
+                        evidence_status=eval_res["evidence_status"],
+                        metadata={"evaluation": eval_res}
+                    )
+                except Exception:
+                    pass
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(token_generator(), media_type="text/event-stream")

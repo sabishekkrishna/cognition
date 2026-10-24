@@ -70,7 +70,7 @@ export const LLMConsolePage: React.FC<LLMConsolePageProps> = ({
     if (provId === 'ollama') setServerUrl('http://127.0.0.1:11434');
     else if (provId === 'lm_studio') setServerUrl('http://127.0.0.1:1234/v1');
     else if (provId === 'llama_cpp') setServerUrl('http://127.0.0.1:8080/v1');
-    else if (provId === 'custom_http') setServerUrl('http://localhost:3000');
+    else if (provId === 'custom_http') setServerUrl('http://localhost:8080');
     else setServerUrl('internal://mock');
   };
 

@@ -170,6 +170,12 @@ export const api = {
     return res.json();
   },
 
+  async getLLMInteractions(limit: number = 50) {
+    const res = await fetch(`${API_BASE}/llm/interactions?limit=${limit}`);
+    if (!res.ok) throw new Error('Failed to fetch LLM interactions');
+    return res.json();
+  },
+
   async testLLMConnection(payload: {
     provider: string;
     host?: string;
